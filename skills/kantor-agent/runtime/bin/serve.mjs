@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
@@ -114,19 +115,61 @@ function sendRedirect(res, status, location) {
   res.end();
 }
 
-function servePage(res, runtimeDir) {
+function escHtml(s) {
+  return String(s ?? '').replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  }[c]));
+}
+
+function buildPageConfig(cfg) {
+  return {
+    title: cfg?.title || 'Project',
+    ketua: cfg?.ketua || 'Joko',
+    ketua_role: cfg?.ketua_role || 'Lead Architect',
+    team: Array.isArray(cfg?.team) ? cfg.team : ['Budi', 'Sari', 'Agus', 'Rina'],
+    divisions: Array.isArray(cfg?.divisions) ? cfg.divisions : [],
+    colors: cfg?.colors || {},
+    spare_desks: Number.isInteger(cfg?.spare_desks) ? cfg.spare_desks : 4,
+    chat: cfg?.chat || {
+      enabled: true,
+      default_mode: 'accept-edits',
+      default_model: null,
+      sandbox: false,
+    },
+  };
+}
+
+function servePage(res, runtimeDir, cfg = {}) {
+  const nonce = crypto.randomBytes(16).toString('base64');
+  const pageCsp = SECURITY_HEADERS['Content-Security-Policy'].replace(
+    "script-src 'self'",
+    `script-src 'self' 'nonce-${nonce}'`
+  );
+  const pageHeaders = {
+    'Cache-Control': 'no-cache',
+    'X-Robots-Tag': 'noindex, nofollow',
+    'Content-Security-Policy': pageCsp,
+  };
   const pagePath = path.join(runtimeDir, 'views', 'page.html');
   if (isFile(pagePath)) {
     try {
-      const html = fs.readFileSync(pagePath, 'utf8');
-      return sendBuffer(res, 200, 'text/html; charset=utf-8', html, { 'Cache-Control': 'no-cache' });
+      const rawHtml = fs.readFileSync(pagePath, 'utf8');
+      const replacements = {
+        TITLE: escHtml(cfg?.title || 'Project'),
+        CONFIG_JSON: escHtml(JSON.stringify(buildPageConfig(cfg))),
+        CSP_NONCE: nonce,
+      };
+      const html = rawHtml.replace(/\{\{(TITLE|CONFIG_JSON|CSP_NONCE)\}\}/g, (_, k) => replacements[k]);
+      return sendBuffer(res, 200, 'text/html; charset=utf-8', html, pageHeaders);
     } catch {
       return sendJson(res, 500, { ok: false, error: 'Gagal membaca halaman UI' });
     }
   }
-  return sendBuffer(res, 200, 'text/html; charset=utf-8', FALLBACK_PAGE_HTML, {
-    'Cache-Control': 'no-cache',
-  });
+  return sendBuffer(res, 200, 'text/html; charset=utf-8', FALLBACK_PAGE_HTML, pageHeaders);
 }
 
 function serveStaticAsset(res, runtimeDir, rawRelPath) {
@@ -451,7 +494,7 @@ export function createKantorServer(opts = {}) {
         if (method !== 'GET') {
           return sendJson(res, 405, { ok: false, error: 'Metode tidak diizinkan' }, { Allow: 'GET' });
         }
-        return servePage(res, runtimeDir);
+        return servePage(res, runtimeDir, cfg);
       }
 
       if (pathname === '/kerja/api/ping') {
