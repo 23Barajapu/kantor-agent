@@ -103,7 +103,11 @@ describe('util.mjs', () => {
     it('handles paths with spaces and encoded characters', () => {
       const uriWithSpace = 'file:///C:/My%20Workspaces/Project%201/';
       const resSpace = normalizeWorkspacePath(uriWithSpace);
-      assert.ok(resSpace.includes('my workspaces/project 1'));
+      if (process.platform === 'win32') {
+        assert.ok(resSpace.includes('my workspaces/project 1'));
+      } else {
+        assert.ok(resSpace.includes('My Workspaces/Project 1'));
+      }
       assert.ok(!resSpace.endsWith('/'));
     });
 
@@ -366,9 +370,54 @@ describe('config.mjs', () => {
     }
   });
 
+  it('loadDefaults validates 4 team members and 4 complete division objects', () => {
+    const tmpRuntime = fs.mkdtempSync(path.join(os.tmpdir(), 'kantor-test-defaults-'));
+    try {
+      // 1. Missing team or invalid team length
+      fs.writeFileSync(
+        path.join(tmpRuntime, 'defaults.json'),
+        JSON.stringify({ team: ['Budi', 'Sari', 'Agus'], divisions: [] }),
+        'utf8'
+      );
+      assert.throws(() => loadDefaults(tmpRuntime), /team/i);
+
+      // 2. Invalid divisions length
+      fs.writeFileSync(
+        path.join(tmpRuntime, 'defaults.json'),
+        JSON.stringify({
+          team: ['Budi', 'Sari', 'Agus', 'Rina'],
+          divisions: [
+            { id: 'frontend', label: 'Frontend & UI', match_types: ['a'], match_keywords: ['b'] },
+          ],
+        }),
+        'utf8'
+      );
+      assert.throws(() => loadDefaults(tmpRuntime), /divisions/i);
+
+      // 3. Incomplete division fields
+      fs.writeFileSync(
+        path.join(tmpRuntime, 'defaults.json'),
+        JSON.stringify({
+          team: ['Budi', 'Sari', 'Agus', 'Rina'],
+          divisions: [
+            { id: 'frontend', label: 'Frontend', match_types: ['a'], match_keywords: ['b'] },
+            { id: 'backend', label: 'Backend', match_types: ['c'], match_keywords: ['d'] },
+            { id: 'qa', label: 'QA', match_types: ['e'], match_keywords: ['f'] },
+            { id: 'product_ops', label: 'Ops', match_types: 'bukan-array', match_keywords: ['h'] },
+          ],
+        }),
+        'utf8'
+      );
+      assert.throws(() => loadDefaults(tmpRuntime), /divisions/i);
+    } finally {
+      fs.rmSync(tmpRuntime, { recursive: true, force: true });
+    }
+  });
+
   it('loadConfig falls back to defaults when project config is missing or invalid', () => {
     const tmpEmpty = fs.mkdtempSync(path.join(os.tmpdir(), 'kantor-test-empty-'));
     try {
+      // 1. Missing file
       const cfg = loadConfig(runtimeDir, tmpEmpty);
       assert.equal(cfg.ketua, 'Joko');
       assert.equal(cfg.ketua_role, 'Lead Architect');
@@ -378,8 +427,201 @@ describe('config.mjs', () => {
       assert.equal(cfg.chat.default_mode, 'accept-edits');
       assert.equal(cfg.chat.sandbox, false);
       assert.equal(cfg.title, path.basename(tmpEmpty));
+
+      // 2. Corrupted JSON syntax
+      const agentsDir = path.join(tmpEmpty, '.agents');
+      fs.mkdirSync(agentsDir, { recursive: true });
+      fs.writeFileSync(path.join(tmpEmpty, CONFIG_REL), '{ corrupted json ...', 'utf8');
+      const cfgCorrupted = loadConfig(runtimeDir, tmpEmpty);
+      assert.equal(cfgCorrupted.ketua, 'Joko');
+      assert.equal(cfgCorrupted.bind, '127.0.0.1');
+
+      // 3. Root is not a plain object (e.g. JSON array)
+      fs.writeFileSync(path.join(tmpEmpty, CONFIG_REL), JSON.stringify([1, 2, 3]), 'utf8');
+      const cfgArray = loadConfig(runtimeDir, tmpEmpty);
+      assert.equal(cfgArray.ketua, 'Joko');
+      assert.equal(cfgArray.bind, '127.0.0.1');
     } finally {
       fs.rmSync(tmpEmpty, { recursive: true, force: true });
+    }
+  });
+
+  it('loadConfig merges and sanitizes partial or invalid divisions', () => {
+    const tmpProject = fs.mkdtempSync(path.join(os.tmpdir(), 'kantor-test-div-'));
+    const agentsDir = path.join(tmpProject, '.agents');
+    fs.mkdirSync(agentsDir, { recursive: true });
+
+    const overrideConfig = {
+      divisions: [
+        {
+          label: '  Frontend Khusus \x00 ',
+          match_types: ['custom-dev'],
+          match_keywords: ['react', 'vue'],
+        },
+        // Division 1 has invalid types, should fallback per-field
+        {
+          id: '   ',
+          label: '\x00\x1f',
+          match_types: 'bukan-array',
+          match_keywords: null,
+        },
+        // Division 2 is not an object, should fallback completely
+        'bukan-objek',
+        // Division 3 is omitted entirely
+      ],
+    };
+    fs.writeFileSync(
+      path.join(tmpProject, CONFIG_REL),
+      JSON.stringify(overrideConfig, null, 2),
+      'utf8'
+    );
+
+    try {
+      const cfg = loadConfig(runtimeDir, tmpProject);
+      assert.equal(Array.isArray(cfg.divisions), true);
+      assert.equal(cfg.divisions.length, 4);
+
+      // Div 0: label sanitized, match_types & keywords overridden, id kept from default
+      assert.equal(cfg.divisions[0].id, 'frontend');
+      assert.equal(cfg.divisions[0].label, 'Frontend Khusus');
+      assert.deepEqual(cfg.divisions[0].match_types, ['custom-dev']);
+      assert.deepEqual(cfg.divisions[0].match_keywords, ['react', 'vue']);
+
+      // Div 1: label and id fallback, match_types and keywords fallback
+      assert.equal(cfg.divisions[1].id, 'backend');
+      assert.equal(cfg.divisions[1].label, 'Backend & AI');
+      assert.ok(cfg.divisions[1].match_types.includes('backend-architect'));
+
+      // Div 2: fallback to QA
+      assert.equal(cfg.divisions[2].id, 'qa');
+      assert.equal(cfg.divisions[2].label, 'QA & Security');
+
+      // Div 3: fallback to product_ops
+      assert.equal(cfg.divisions[3].id, 'product_ops');
+      assert.equal(cfg.divisions[3].label, 'Product & Ops');
+    } finally {
+      fs.rmSync(tmpProject, { recursive: true, force: true });
+    }
+  });
+
+  it('loadConfig validates chat.default_mode and chat.default_model', () => {
+    const tmpProject = fs.mkdtempSync(path.join(os.tmpdir(), 'kantor-test-chat-'));
+    const agentsDir = path.join(tmpProject, '.agents');
+    fs.mkdirSync(agentsDir, { recursive: true });
+
+    try {
+      // 1. Invalid default_mode string falls back to 'accept-edits'
+      fs.writeFileSync(
+        path.join(tmpProject, CONFIG_REL),
+        JSON.stringify({
+          chat: {
+            default_mode: 'unsupported-mode',
+            default_model: 12345,
+          },
+        }),
+        'utf8'
+      );
+      const cfg1 = loadConfig(runtimeDir, tmpProject);
+      assert.equal(cfg1.chat.default_mode, 'accept-edits');
+      assert.equal(cfg1.chat.default_model, null);
+
+      // 2. Empty string model falls back to null
+      fs.writeFileSync(
+        path.join(tmpProject, CONFIG_REL),
+        JSON.stringify({
+          chat: {
+            default_mode: 'auto',
+            default_model: '   ',
+          },
+        }),
+        'utf8'
+      );
+      const cfg2 = loadConfig(runtimeDir, tmpProject);
+      assert.equal(cfg2.chat.default_mode, 'auto');
+      assert.equal(cfg2.chat.default_model, null);
+
+      // 3. Valid non-empty string model is preserved
+      fs.writeFileSync(
+        path.join(tmpProject, CONFIG_REL),
+        JSON.stringify({
+          chat: {
+            default_mode: 'plan',
+            default_model: 'gemini-2.5-pro',
+          },
+        }),
+        'utf8'
+      );
+      const cfg3 = loadConfig(runtimeDir, tmpProject);
+      assert.equal(cfg3.chat.default_mode, 'plan');
+      assert.equal(cfg3.chat.default_model, 'gemini-2.5-pro');
+
+      // 4. Explicit null model is preserved
+      fs.writeFileSync(
+        path.join(tmpProject, CONFIG_REL),
+        JSON.stringify({
+          chat: {
+            default_mode: 'accept-edits',
+            default_model: null,
+          },
+        }),
+        'utf8'
+      );
+      const cfg4 = loadConfig(runtimeDir, tmpProject);
+      assert.equal(cfg4.chat.default_model, null);
+    } finally {
+      fs.rmSync(tmpProject, { recursive: true, force: true });
+    }
+  });
+
+  it('loadConfig strictly honors KANTOR_SANDBOX priority chain (CLI > env > file > default)', () => {
+    const tmpProject = fs.mkdtempSync(path.join(os.tmpdir(), 'kantor-test-sandbox-'));
+    const agentsDir = path.join(tmpProject, '.agents');
+    fs.mkdirSync(agentsDir, { recursive: true });
+
+    try {
+      // Base file: sandbox is false
+      fs.writeFileSync(
+        path.join(tmpProject, CONFIG_REL),
+        JSON.stringify({ chat: { sandbox: false } }),
+        'utf8'
+      );
+
+      // Case A: file=false, env unset, cli unset -> false
+      delete process.env.KANTOR_SANDBOX;
+      assert.equal(loadConfig(runtimeDir, tmpProject).chat.sandbox, false);
+
+      // Case B: file=false, env='1', cli unset -> true (env overrides file)
+      process.env.KANTOR_SANDBOX = '1';
+      assert.equal(loadConfig(runtimeDir, tmpProject).chat.sandbox, true);
+
+      // Case C: file=false, env='true', cli unset -> true
+      process.env.KANTOR_SANDBOX = 'true';
+      assert.equal(loadConfig(runtimeDir, tmpProject).chat.sandbox, true);
+
+      // Case D: file=true, env='0', cli unset -> false (env overrides file)
+      fs.writeFileSync(
+        path.join(tmpProject, CONFIG_REL),
+        JSON.stringify({ chat: { sandbox: true } }),
+        'utf8'
+      );
+      process.env.KANTOR_SANDBOX = '0';
+      assert.equal(loadConfig(runtimeDir, tmpProject).chat.sandbox, false);
+
+      // Case E: file=true, env='1', cli=false -> false (CLI overrides env)
+      process.env.KANTOR_SANDBOX = '1';
+      assert.equal(loadConfig(runtimeDir, tmpProject, { sandbox: false }).chat.sandbox, false);
+
+      // Case F: file=false, env='0', cli=true -> true (CLI overrides env)
+      fs.writeFileSync(
+        path.join(tmpProject, CONFIG_REL),
+        JSON.stringify({ chat: { sandbox: false } }),
+        'utf8'
+      );
+      process.env.KANTOR_SANDBOX = '0';
+      assert.equal(loadConfig(runtimeDir, tmpProject, { sandbox: true }).chat.sandbox, true);
+    } finally {
+      delete process.env.KANTOR_SANDBOX;
+      fs.rmSync(tmpProject, { recursive: true, force: true });
     }
   });
 });
