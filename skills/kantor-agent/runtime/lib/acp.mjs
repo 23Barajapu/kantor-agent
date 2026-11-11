@@ -4,6 +4,8 @@ import { StringDecoder } from 'node:string_decoder';
 import { isFile, isPlainObj, isoMs } from './util.mjs';
 
 const VALID_MODES = new Set(['plan', 'accept-edits', 'auto']);
+const ALLOWED_STATIC_ACP_ARGS = new Set(['acp', '--stdio', '--sandbox']);
+const CMD_UNSAFE_RE = /[\x00-\x1f\x7f"&|<>^%!]/;
 const MAX_HISTORY = 200;
 const MAX_STDOUT_LINE_BYTES = 4 * 1024 * 1024;
 const DEFAULT_RPC_TIMEOUT_MS = 30_000;
@@ -85,11 +87,21 @@ function resolveWindowsBinary(agyBin) {
   return { kind: 'direct', bin: raw };
 }
 
-function quoteCmdToken(token) {
-  if (/[\s"&|<>^()]/.test(token)) {
-    return `"${token}"`;
+function wrapWindowsCmd(binPath, acpArgs) {
+  const cleanBin = String(binPath || '').trim();
+  if (!cleanBin || CMD_UNSAFE_RE.test(cleanBin)) {
+    throw new Error('Path biner ACP mengandung karakter tidak aman untuk cmd.exe');
   }
-  return token;
+  if (!Array.isArray(acpArgs) || !acpArgs.every((arg) => ALLOWED_STATIC_ACP_ARGS.has(arg))) {
+    throw new Error('Argumen ACP tidak valid untuk eksekusi cmd.exe');
+  }
+  const comSpec = process.env.ComSpec || 'cmd.exe';
+  const cmdLine = `""${cleanBin}" ${acpArgs.join(' ')}"`;
+  return {
+    cmd: comSpec,
+    args: ['/d', '/s', '/c', cmdLine],
+    isCmd: true,
+  };
 }
 
 /**
@@ -150,6 +162,7 @@ export class AcpBridge {
 
     this.child = null;
     this._boundChild = null;
+    this._spawnedViaCmd = false;
     this._stdoutDecoder = new StringDecoder('utf8');
     this._stdoutBuffer = '';
     this._skipOversizedLine = false;
@@ -590,7 +603,7 @@ export class AcpBridge {
           shell: false,
           stdio: ['pipe', 'pipe', 'pipe'],
         },
-        viaCmd: false,
+        isCmd: false,
       };
     }
 
@@ -606,18 +619,14 @@ export class AcpBridge {
             shell: false,
             stdio: ['pipe', 'pipe', 'pipe'],
           },
-          viaCmd: false,
+          isCmd: false,
         };
       }
       if (resolved.kind === 'cmd') {
-        if (/[\r\n\0"%!]/.test(resolved.bin)) {
-          throw new Error('Path biner ACP tidak valid untuk cmd.exe');
-        }
-        const comSpec = process.env.ComSpec || 'cmd.exe';
-        const cmdLine = `"${[quoteCmdToken(resolved.bin), ...acpArgs].join(' ')}"`;
+        const wrapped = wrapWindowsCmd(resolved.bin, acpArgs);
         return {
-          cmd: comSpec,
-          args: ['/d', '/s', '/c', cmdLine],
+          cmd: wrapped.cmd,
+          args: wrapped.args,
           options: {
             cwd: this.projectDir,
             windowsHide: true,
@@ -625,7 +634,7 @@ export class AcpBridge {
             shell: false,
             stdio: ['pipe', 'pipe', 'pipe'],
           },
-          viaCmd: true,
+          isCmd: true,
         };
       }
       return {
@@ -637,7 +646,7 @@ export class AcpBridge {
           shell: false,
           stdio: ['pipe', 'pipe', 'pipe'],
         },
-        viaCmd: false,
+        isCmd: false,
       };
     }
 
@@ -650,14 +659,62 @@ export class AcpBridge {
         shell: false,
         stdio: ['pipe', 'pipe', 'pipe'],
       },
-      viaCmd: false,
+      isCmd: false,
     };
+  }
+
+  _drainStdoutLines() {
+    let nlIdx;
+    while ((nlIdx = this._stdoutBuffer.indexOf('\n')) !== -1) {
+      let line = this._stdoutBuffer.slice(0, nlIdx);
+      this._stdoutBuffer = this._stdoutBuffer.slice(nlIdx + 1);
+      if (line.endsWith('\r')) line = line.slice(0, -1);
+      if (Buffer.byteLength(line, 'utf8') > MAX_STDOUT_LINE_BYTES) {
+        this.lastError = 'Baris output ACP melebihi batas 4 MB';
+        this._broadcastSse('error', { error: this.lastError });
+        continue;
+      }
+      this._handleStdoutLine(line);
+    }
+  }
+
+  _flushStdoutRemaining(child) {
+    if (this.child !== child) return;
+    const endedText = this._stdoutDecoder.end();
+    if (endedText) {
+      if (this._skipOversizedLine) {
+        const nlPos = endedText.indexOf('\n');
+        if (nlPos !== -1) {
+          this._skipOversizedLine = false;
+          this._stdoutBuffer = endedText.slice(nlPos + 1);
+        }
+      } else {
+        this._stdoutBuffer += endedText;
+      }
+    }
+
+    if (!this._skipOversizedLine) {
+      this._drainStdoutLines();
+      const tail = this._stdoutBuffer.replace(/\r$/, '');
+      if (tail.trim()) {
+        if (Buffer.byteLength(tail, 'utf8') > MAX_STDOUT_LINE_BYTES) {
+          this.lastError = 'Baris output ACP melebihi batas 4 MB';
+          this._broadcastSse('error', { error: this.lastError });
+        } else {
+          this._handleStdoutLine(tail);
+        }
+      }
+    }
+
+    this._stdoutBuffer = '';
+    this._skipOversizedLine = false;
   }
 
   _handleChildExit(child, errMessage, isError) {
     if (this.child === child) {
       this.child = null;
       this._boundChild = null;
+      this._spawnedViaCmd = false;
       this.connected = false;
       this.busy = false;
       this.sessionId = null;
@@ -690,9 +747,10 @@ export class AcpBridge {
     this._stdoutBuffer = '';
     this._skipOversizedLine = false;
     this._lastStderr = '';
+    this._spawnedViaCmd = Boolean(spec.isCmd);
 
     const child = spawn(spec.cmd, spec.args, spec.options);
-    child._viaCmd = spec.viaCmd;
+    child._viaCmd = Boolean(spec.isCmd);
     this.child = child;
 
     let disconnected = false;
@@ -718,18 +776,7 @@ export class AcpBridge {
         this._stdoutBuffer += text;
       }
 
-      let nlIdx;
-      while ((nlIdx = this._stdoutBuffer.indexOf('\n')) !== -1) {
-        let line = this._stdoutBuffer.slice(0, nlIdx);
-        this._stdoutBuffer = this._stdoutBuffer.slice(nlIdx + 1);
-        if (line.endsWith('\r')) line = line.slice(0, -1);
-        if (Buffer.byteLength(line, 'utf8') > MAX_STDOUT_LINE_BYTES) {
-          this.lastError = 'Baris output ACP melebihi batas 4 MB';
-          this._broadcastSse('error', { error: this.lastError });
-          continue;
-        }
-        this._handleStdoutLine(line);
-      }
+      this._drainStdoutLines();
 
       if (Buffer.byteLength(this._stdoutBuffer, 'utf8') > MAX_STDOUT_LINE_BYTES) {
         this._stdoutBuffer = '';
@@ -740,13 +787,7 @@ export class AcpBridge {
     });
 
     child.stdout?.on('end', () => {
-      if (this.child !== child) return;
-      const tail = (this._skipOversizedLine ? '' : this._stdoutBuffer) + this._stdoutDecoder.end();
-      this._stdoutBuffer = '';
-      this._skipOversizedLine = false;
-      if (tail.trim() && Buffer.byteLength(tail, 'utf8') <= MAX_STDOUT_LINE_BYTES) {
-        this._handleStdoutLine(tail.replace(/\r$/, ''));
-      }
+      this._flushStdoutRemaining(child);
     });
 
     child.stderr?.on('data', (chunk) => {
@@ -773,6 +814,7 @@ export class AcpBridge {
     const child = this.child;
     if (!child) {
       this._boundChild = null;
+      this._spawnedViaCmd = false;
       this.connected = false;
       this.busy = false;
       this.sessionId = null;
@@ -783,6 +825,7 @@ export class AcpBridge {
       if (this.child === child) {
         this.child = null;
         this._boundChild = null;
+        this._spawnedViaCmd = false;
         this.sessionId = null;
       }
       this.connected = false;
@@ -805,6 +848,7 @@ export class AcpBridge {
         if (this.child === child) {
           this.child = null;
           this._boundChild = null;
+          this._spawnedViaCmd = false;
           this.sessionId = null;
         }
         this.connected = false;
@@ -828,11 +872,12 @@ export class AcpBridge {
       killTimer = setTimeout(() => {
         try {
           if (child.exitCode === null && child.signalCode === null) {
-            if (process.platform === 'win32' && child._viaCmd && Number.isInteger(child.pid)) {
-              const killer = spawn('taskkill', ['/T', '/F', '/PID', String(child.pid)], {
+            if (process.platform === 'win32' && (child._viaCmd || this._spawnedViaCmd) && Number.isInteger(child.pid)) {
+              const killer = spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], {
                 windowsHide: true,
                 stdio: 'ignore',
               });
+              killer.on('error', () => {});
               killer.unref();
             }
             child.kill('SIGKILL');
@@ -919,13 +964,14 @@ export class AcpBridge {
       throw new Error('ACP session/new tidak mengembalikan sessionId');
     }
 
+    await this._applySessionMode(newSessionId, targetMode);
+    if (targetModel !== null) {
+      await this._applySessionModel(newSessionId, targetModel);
+    }
+
     this.sessionId = newSessionId;
     this._boundChild = this.child;
-    await this._applySessionMode(this.sessionId, targetMode);
     this.mode = targetMode;
-    if (targetModel !== null) {
-      await this._applySessionModel(this.sessionId, targetModel);
-    }
     this.model = targetModel;
 
     this._pushHistory({
@@ -1016,12 +1062,13 @@ export class AcpBridge {
         mcpServers: [],
       });
 
+      await this._applySessionMode(sessionId, this.mode);
+      if (this.model !== null) {
+        await this._applySessionModel(sessionId, this.model);
+      }
+
       this.sessionId = sessionId;
       this._boundChild = this.child;
-      await this._applySessionMode(this.sessionId, this.mode);
-      if (this.model !== null) {
-        await this._applySessionModel(this.sessionId, this.model);
-      }
 
       this._pushHistory({
         type: 'session',
@@ -1049,7 +1096,7 @@ export class AcpBridge {
     }
   }
 
-  async _applyConfigInternal({ mode, model } = {}) {
+  async _setConfigInternal({ mode, model } = {}) {
     const nextMode = mode !== undefined ? mode : this.mode;
     const nextModel = model !== undefined ? (model === null ? null : model.trim()) : this.model;
 
@@ -1084,7 +1131,7 @@ export class AcpBridge {
 
     this._sessionBusy = true;
     try {
-      return await this._applyConfigInternal({ mode, model });
+      return await this._setConfigInternal({ mode, model });
     } finally {
       this._sessionBusy = false;
     }
@@ -1131,7 +1178,7 @@ export class AcpBridge {
           this.sessionId = null;
           await this._createSessionInternal({ mode, model });
         } else if (mode !== undefined || model !== undefined) {
-          await this._applyConfigInternal({ mode, model });
+          await this._setConfigInternal({ mode, model });
         }
       }
 

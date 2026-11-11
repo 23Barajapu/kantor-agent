@@ -101,7 +101,7 @@ function handlePrompt(msg) {
 
   if (text.includes('__TRAILING_FRAME_EXIT__')) {
     send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
-    // Tulis frame NDJSON tanpa newline tepat sebelum stdout ditutup dan proses exit
+    // Tulis frame NDJSON tanpa newline dengan UTF-8 multi-byte di EOF tepat sebelum stdout ditutup
     process.stdout.write(
       JSON.stringify({
         jsonrpc: '2.0',
@@ -110,7 +110,7 @@ function handlePrompt(msg) {
           sessionId,
           update: {
             sessionUpdate: 'agent_message_chunk',
-            content: { type: 'text', text: 'Frame terakhir tanpa newline' },
+            content: { type: 'text', text: 'Frame terakhir tanpa newline 🚀' },
           },
         },
       })
@@ -401,6 +401,10 @@ function handleMessage(msg) {
         return;
       }
       case 'session/set_mode': {
+        if (process.env.FAKE_AGY_FAIL_SET_MODE === '1') {
+          send({ jsonrpc: '2.0', id: msg.id, error: { code: -32602, message: 'Invalid mode forced by test' } });
+          return;
+        }
         const sessionId = typeof params.sessionId === 'string' ? params.sessionId : '';
         if (!sessionId || !sessions.has(sessionId)) {
           send({ jsonrpc: '2.0', id: msg.id, error: { code: -32602, message: `Unknown sessionId: ${sessionId}` } });

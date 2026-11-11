@@ -671,7 +671,7 @@ describe('AcpBridge (lib/acp.mjs)', () => {
       await bridgeHang.shutdown();
       delete process.env.FAKE_AGY_HANG_INIT;
 
-      // 5. Windows .cmd wrapper execution via ComSpec (only on win32)
+      // 5. Windows .cmd wrapper execution via ComSpec & metacharacter rejection (only on win32)
       if (process.platform === 'win32') {
         const cmdPath = path.join(dir, 'agy wrapper.cmd');
         fs.writeFileSync(cmdPath, `@echo off\r\n"${process.execPath}" "${FAKE_AGY}" %*\r\n`, 'utf8');
@@ -687,9 +687,17 @@ describe('AcpBridge (lib/acp.mjs)', () => {
         } finally {
           await bridgeCmd.shutdown();
         }
+
+        const unsafeCmdBridge = new AcpBridge({
+          projectDir: dir,
+          agyBin: path.join(dir, 'agy&calc.cmd'),
+        });
+        await assert.rejects(() => unsafeCmdBridge.createSession(), /tidak aman/);
+        assert.equal(unsafeCmdBridge.child, null);
+        await unsafeCmdBridge.shutdown();
       }
 
-      // 6. Multi-byte UTF-8 split across chunks & trailing NDJSON frame emitted right before stdout close
+      // 6. Multi-byte UTF-8 split across chunks & trailing NDJSON frame with UTF-8 emitted right before stdout close
       const bridgeFrames = new AcpBridge({ projectDir: dir, agyBin: FAKE_AGY });
       const sseFrames = createMockSseRes();
       try {
@@ -701,10 +709,43 @@ describe('AcpBridge (lib/acp.mjs)', () => {
         await bridgeFrames.sendPrompt('__TRAILING_FRAME_EXIT__');
         await bridgeFrames.waitForTurn();
         await sseFrames.waitForEvent('session_update', 3000, (d) =>
-          String(d.text).includes('Frame terakhir tanpa newline')
+          String(d.text).includes('Frame terakhir tanpa newline 🚀')
         );
       } finally {
         await bridgeFrames.shutdown();
+      }
+
+      // 6b. sendPrompt({ text, mode, model }) on an ALREADY active session uses _setConfigInternal without 409,
+      //     and failed _applySessionMode in createSession() rolls back without leaving orphan sessionId/_boundChild
+      const bridgeOverride = new AcpBridge({ projectDir: dir, agyBin: FAKE_AGY });
+      try {
+        const sInit = await bridgeOverride.createSession();
+        assert.equal(sInit.mode, 'accept-edits');
+        const promptOverrideRes = await bridgeOverride.sendPrompt({
+          text: 'uji mode',
+          mode: 'plan',
+          model: 'gemini-test',
+        });
+        assert.equal(promptOverrideRes.status, 202);
+        assert.equal(promptOverrideRes.body.ok, true);
+        assert.equal(bridgeOverride.getStatus().mode, 'plan');
+        assert.equal(bridgeOverride.getStatus().model, 'gemini-test');
+        await bridgeOverride.waitForTurn();
+      } finally {
+        await bridgeOverride.shutdown();
+      }
+
+      const prevFailSetMode = process.env.FAKE_AGY_FAIL_SET_MODE;
+      process.env.FAKE_AGY_FAIL_SET_MODE = '1';
+      const bridgeRollback = new AcpBridge({ projectDir: dir, agyBin: FAKE_AGY });
+      try {
+        await assert.rejects(() => bridgeRollback.createSession(), /Invalid mode forced by test/);
+        assert.equal(bridgeRollback.getStatus().sessionId, null);
+        assert.equal(bridgeRollback._boundChild, null);
+      } finally {
+        if (prevFailSetMode === undefined) delete process.env.FAKE_AGY_FAIL_SET_MODE;
+        else process.env.FAKE_AGY_FAIL_SET_MODE = prevFailSetMode;
+        await bridgeRollback.shutdown();
       }
 
       // 7. fake-agy rejects -32602 for unknown/uncreated sessionId, openSession rejects ""/{} with 400, and _sessionBusy blocks parallel races (409)
@@ -910,6 +951,20 @@ describe('serve.mjs + AcpBridge HTTP integration', () => {
       });
       assert.equal(reloadSelf.status, 200);
       assert.equal(reloadSelf.json.sessionId, 'cli-idle-1');
+
+      // sendPrompt({ text, mode, model }) pada sesi yang sudah aktif via HTTP berhasil 202 (tanpa 409)
+      const sendOverrideHttp = await rawRequest(port, {
+        method: 'POST',
+        reqPath: '/kerja/api/chat/send',
+        headers: { Host: `127.0.0.1:${port}`, Origin: origin, Cookie: cookiePair, 'Content-Type': 'application/json' },
+        body: { text: 'uji mode', mode: 'auto', model: 'gemini-test' },
+      });
+      assert.equal(sendOverrideHttp.status, 202);
+      assert.equal(sendOverrideHttp.json.ok, true);
+      assert.equal(sendOverrideHttp.json.status.mode, 'auto');
+      assert.equal(sendOverrideHttp.json.status.model, 'gemini-test');
+      await liveSse.waitForEvent('turn_done', 3000, (d) => d.status?.mode === 'auto');
+      await server.acpBridge.waitForTurn();
 
       // Slow turn + concurrent HTTP 409 + cancel via HTTP
       const sendSlow = await rawRequest(port, {
