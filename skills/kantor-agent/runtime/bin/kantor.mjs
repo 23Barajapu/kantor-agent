@@ -72,11 +72,19 @@ export function setupTeam({ configDir, resourcesDir, force = false } = {}) {
   const skipped = [];
 
   for (const name of files) {
+    if (path.basename(name) !== name) continue;
     const src = path.join(resolvedResourcesDir, name);
     const dest = path.join(agentsDir, name);
-    if (fs.existsSync(dest) && !force) {
+    let destStat = null;
+    try {
+      destStat = fs.lstatSync(dest);
+    } catch {}
+    if (destStat !== null && !force) {
       skipped.push(name);
       continue;
+    }
+    if (destStat !== null && destStat.isSymbolicLink()) {
+      fs.unlinkSync(dest);
     }
     fs.copyFileSync(src, dest);
     copied.push(name);
@@ -220,15 +228,6 @@ function processAlive(pid) {
 
 async function terminatePid(pid, gracefulWaitMs = 500) {
   if (!processAlive(pid)) return;
-  try {
-    process.kill(pid, 'SIGTERM');
-  } catch {}
-
-  const deadline = Date.now() + gracefulWaitMs;
-  while (Date.now() < deadline) {
-    if (!processAlive(pid)) return;
-    await sleep(50);
-  }
 
   if (process.platform === 'win32') {
     try {
@@ -239,6 +238,16 @@ async function terminatePid(pid, gracefulWaitMs = 500) {
     } catch {}
   } else {
     try {
+      process.kill(pid, 'SIGTERM');
+    } catch {}
+
+    const deadline = Date.now() + gracefulWaitMs;
+    while (Date.now() < deadline) {
+      if (!processAlive(pid)) return;
+      await sleep(50);
+    }
+
+    try {
       process.kill(pid, 'SIGKILL');
     } catch {}
   }
@@ -248,6 +257,133 @@ async function terminatePid(pid, gracefulWaitMs = 500) {
     if (!processAlive(pid)) return;
     await sleep(50);
   }
+}
+
+async function getWindowsProcessImage(pid) {
+  try {
+    const { stdout } = await execFileAsync(
+      'tasklist',
+      ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'],
+      { windowsHide: true, timeout: 3000 }
+    );
+    const line = stdout.trim().split(/\r?\n/)[0] || '';
+    const m = /^"([^"]+)"\s*,\s*"(\d+)"/.exec(line);
+    if (!m || Number(m[2]) !== pid) return null;
+    return m[1].toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+async function getWindowsCommandLine(pid) {
+  try {
+    const { stdout } = await execFileAsync(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `(Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}').CommandLine`,
+      ],
+      { windowsHide: true, timeout: 5000 }
+    );
+    return stdout.trim();
+  } catch {
+    return '';
+  }
+}
+
+async function getPosixCommandLine(pid) {
+  try {
+    const { stdout } = await execFileAsync('ps', ['-p', String(pid), '-o', 'args='], {
+      timeout: 3000,
+    });
+    return stdout.trim();
+  } catch {
+    return '';
+  }
+}
+
+function isServeCommandLine(cmdLine) {
+  return /\bserve\.mjs\b/i.test(String(cmdLine || ''));
+}
+
+function isCloudflaredCommandLine(cmdLine, meta = null) {
+  const s = String(cmdLine || '').toLowerCase();
+  if (s.includes('cloudflared')) return true;
+  const binHint = typeof meta?.binHint === 'string' ? meta.binHint.trim().toLowerCase() : '';
+  if (binHint && (binHint.endsWith('.mjs') || binHint.endsWith('.js')) && s.includes(binHint)) {
+    return true;
+  }
+  const envCf =
+    typeof process.env.KANTOR_CLOUDFLARED_BIN === 'string'
+      ? process.env.KANTOR_CLOUDFLARED_BIN.trim().toLowerCase()
+      : '';
+  if (envCf && (envCf.endsWith('.mjs') || envCf.endsWith('.js')) && s.includes(path.basename(envCf))) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Memverifikasi identitas PID sebelum menganggap proses milik Kantor Agent atau mengirim sinyal kill,
+ * untuk mencegah PID reuse membunuh proses asing.
+ */
+export async function verifyPidIdentity(pid, expectedKind, meta = null) {
+  if (!Number.isInteger(pid) || pid <= 0 || !processAlive(pid)) {
+    return false;
+  }
+
+  if (expectedKind === 'serve') {
+    if (meta && Number.isInteger(meta.port)) {
+      const connectHost = meta.connectHost || connectHostForBind(meta.bind || '127.0.0.1');
+      const ping = await probePing(connectHost, meta.port, 800);
+      if (ping) {
+        if (process.platform === 'win32') {
+          const img = await getWindowsProcessImage(pid);
+          if (img === 'node.exe' || img === 'node') return true;
+        } else {
+          const cmd = await getPosixCommandLine(pid);
+          if (/\bnode\b/i.test(cmd) || isServeCommandLine(cmd)) return true;
+        }
+      }
+    }
+
+    if (process.platform === 'win32') {
+      const img = await getWindowsProcessImage(pid);
+      if (img !== 'node.exe' && img !== 'node') return false;
+      const cmd = await getWindowsCommandLine(pid);
+      return isServeCommandLine(cmd);
+    }
+
+    const cmd = await getPosixCommandLine(pid);
+    return isServeCommandLine(cmd);
+  }
+
+  if (expectedKind === 'cloudflared') {
+    const allowNodeTest =
+      (typeof meta?.binHint === 'string' && /\.(?:mjs|js)$/i.test(meta.binHint)) ||
+      (typeof process.env.KANTOR_CLOUDFLARED_BIN === 'string' &&
+        /\.(?:mjs|js)$/i.test(process.env.KANTOR_CLOUDFLARED_BIN.trim()));
+
+    if (process.platform === 'win32') {
+      const img = await getWindowsProcessImage(pid);
+      if (!img) return false;
+      if (img === 'cloudflared.exe' || img === 'cloudflared') return true;
+      if (img === 'cmd.exe' || (allowNodeTest && (img === 'node.exe' || img === 'node'))) {
+        const cmd = await getWindowsCommandLine(pid);
+        return isCloudflaredCommandLine(cmd, meta);
+      }
+      return false;
+    }
+
+    const cmd = await getPosixCommandLine(pid);
+    if (!cmd) return false;
+    if (cmd.toLowerCase().includes('cloudflared')) return true;
+    return allowNodeTest && isCloudflaredCommandLine(cmd, meta);
+  }
+
+  return false;
 }
 
 function readJsonFile(filePath) {
@@ -263,10 +399,20 @@ function readJsonFile(filePath) {
 
 function writePrivateFile(filePath, content) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(filePath, content, { encoding: 'utf8', mode: 0o600 });
+  const tmpPath = `${filePath}.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}.tmp`;
   try {
-    fs.chmodSync(filePath, 0o600);
-  } catch {}
+    fs.writeFileSync(tmpPath, content, { encoding: 'utf8', mode: 0o600 });
+    try {
+      fs.chmodSync(tmpPath, 0o600);
+    } catch {}
+    fs.renameSync(tmpPath, filePath);
+    try {
+      fs.chmodSync(filePath, 0o600);
+    } catch {}
+  } catch (err) {
+    removeFileSafe(tmpPath);
+    throw err;
+  }
 }
 
 function removeFileSafe(filePath) {
@@ -434,7 +580,7 @@ async function stopTunnelInStorage(storageDir) {
   const tunnelUrlPath = path.join(storageDir, 'tunnel-url.txt');
   const meta = readJsonFile(tunnelJsonPath);
   const hadFile = Boolean(meta) || fs.existsSync(tunnelJsonPath) || fs.existsSync(tunnelUrlPath);
-  const wasAlive = Boolean(meta?.pid && processAlive(meta.pid));
+  const wasAlive = Boolean(meta?.pid && (await verifyPidIdentity(meta.pid, 'cloudflared', meta)));
   if (wasAlive) {
     await terminatePid(meta.pid, 500);
   }
@@ -596,7 +742,7 @@ async function handleStart(args) {
 
   const serverJsonPath = path.join(storageDir, 'server.json');
   const existing = readJsonFile(serverJsonPath);
-  if (existing && processAlive(existing.pid) && Number.isInteger(existing.port)) {
+  if (existing && Number.isInteger(existing.port) && (await verifyPidIdentity(existing.pid, 'serve', existing))) {
     const existingHost = existing.connectHost || connectHostForBind(existing.bind || bind);
     const ping = await probePing(existingHost, existing.port);
     if (ping) {
@@ -753,7 +899,7 @@ async function handleStop(args) {
   await stopTunnelInStorage(storageDir);
 
   const meta = readJsonFile(serverJsonPath);
-  const wasAlive = Boolean(meta?.pid && processAlive(meta.pid));
+  const wasAlive = Boolean(meta?.pid && (await verifyPidIdentity(meta.pid, 'serve', meta)));
   if (wasAlive) {
     await terminatePid(meta.pid, 500);
   }
@@ -843,19 +989,27 @@ async function handleUrl(args) {
   const projectDir = path.resolve(args.project || process.cwd());
   const storageDir = resolveStorageDir(args, projectDir);
   const meta = readJsonFile(path.join(storageDir, 'server.json'));
-  if (!meta || !processAlive(meta.pid) || !Number.isInteger(meta.port)) {
+  if (!meta || !Number.isInteger(meta.port)) {
     process.stderr.write('Kantor Agent belum berjalan. Jalankan perintah "start" terlebih dahulu.\n');
+    return 1;
+  }
+
+  const connectHost = meta.connectHost || connectHostForBind(meta.bind || '127.0.0.1');
+  const ping = await probePing(connectHost, meta.port);
+  if (!ping) {
+    process.stderr.write(`Server Kantor Agent pada port ${meta.port} tidak merespons.\n`);
     return 1;
   }
 
   const tunnelMeta = readJsonFile(path.join(storageDir, 'tunnel.json'));
   const rawTunnel = (readText(path.join(storageDir, 'tunnel-url.txt')) || '').trim();
-  const hasLiveTunnel =
+  const hasLiveTunnel = Boolean(
     tunnelMeta?.pid &&
-    processAlive(tunnelMeta.pid) &&
-    /^https:\/\/[A-Za-z0-9.-]+(:\d+)?\/kerja$/.test(rawTunnel);
+      tunnelMeta.localPort === meta.port &&
+      /^https:\/\/[A-Za-z0-9.-]+(:\d+)?\/kerja$/.test(rawTunnel) &&
+      (await verifyPidIdentity(tunnelMeta.pid, 'cloudflared', tunnelMeta))
+  );
 
-  const connectHost = meta.connectHost || connectHostForBind(meta.bind || '127.0.0.1');
   const localUrl = meta.url || `http://${formatHostForUrl(connectHost)}:${meta.port}/kerja`;
   const chosenUrl = hasLiveTunnel ? rawTunnel : localUrl;
 
@@ -949,7 +1103,12 @@ async function handleTunnel(args) {
   const tunnelUrlPath = path.join(storageDir, 'tunnel-url.txt');
   const existingTunnel = readJsonFile(tunnelJsonPath);
   const existingUrl = (readText(tunnelUrlPath) || '').trim();
-  if (existingTunnel?.pid && processAlive(existingTunnel.pid) && existingUrl) {
+  if (
+    existingTunnel?.pid &&
+    existingTunnel.localPort === meta.port &&
+    /^https:\/\/[A-Za-z0-9.-]+(:\d+)?\/kerja$/.test(existingUrl) &&
+    (await verifyPidIdentity(existingTunnel.pid, 'cloudflared', existingTunnel))
+  ) {
     if (args.json) {
       process.stdout.write(`${JSON.stringify({ ok: true, alreadyRunning: true, url: existingUrl, tokenFile }, null, 2)}\n`);
     } else if (!args.quiet) {
@@ -982,8 +1141,11 @@ async function handleTunnel(args) {
   removeFileSafe(tunnelJsonPath);
   removeFileSafe(tunnelUrlPath);
   const tunnelLogPath = path.join(storageDir, 'tunnel.log');
-  writePrivateFile(tunnelLogPath, '');
-  const logFd = fs.openSync(tunnelLogPath, 'a', 0o600);
+  fs.mkdirSync(storageDir, { recursive: true, mode: 0o700 });
+  const logFd = fs.openSync(tunnelLogPath, 'w', 0o600);
+  try {
+    fs.chmodSync(tunnelLogPath, 0o600);
+  } catch {}
 
   let child;
   let childExited = false;
@@ -1040,7 +1202,17 @@ async function handleTunnel(args) {
     writePrivateFile(tunnelUrlPath, `${publicUrl}\n`);
     writePrivateFile(
       tunnelJsonPath,
-      `${JSON.stringify({ pid: child.pid, url: publicUrl, localPort: meta.port, startedAt: new Date().toISOString() }, null, 2)}\n`
+      `${JSON.stringify(
+        {
+          pid: child.pid,
+          url: publicUrl,
+          localPort: meta.port,
+          binHint: path.basename(cfPath),
+          startedAt: new Date().toISOString(),
+        },
+        null,
+        2
+      )}\n`
     );
 
     if (args.json) {
@@ -1078,22 +1250,103 @@ async function handleTunnelStop(args) {
   return 0;
 }
 
-export function resolveAutostartProject(args = {}, cwd = process.cwd()) {
+function readHookStdinJson(timeoutMs = 50) {
+  if (process.stdin.isTTY) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    const chunks = [];
+    let totalBytes = 0;
+    let settled = false;
+    const MAX_STDIN_BYTES = 65536;
+
+    const finish = (rawText) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      process.stdin.off('data', onData);
+      process.stdin.off('end', onEnd);
+      process.stdin.off('error', onError);
+      try {
+        process.stdin.pause();
+        process.stdin.unref?.();
+      } catch {}
+      const trimmed = String(rawText || '').trim();
+      if (!trimmed) {
+        resolve(null);
+        return;
+      }
+      try {
+        const parsed = JSON.parse(trimmed);
+        resolve(parsed && typeof parsed === 'object' ? parsed : null);
+      } catch {
+        resolve(null);
+      }
+    };
+
+    const onData = (chunk) => {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), 'utf8');
+      totalBytes += buf.length;
+      if (totalBytes > MAX_STDIN_BYTES) {
+        finish('');
+        return;
+      }
+      chunks.push(buf);
+    };
+
+    const onEnd = () => finish(Buffer.concat(chunks).toString('utf8'));
+    const onError = () => finish('');
+
+    const timer = setTimeout(() => {
+      finish(Buffer.concat(chunks).toString('utf8'));
+    }, timeoutMs);
+    timer.unref?.();
+
+    process.stdin.on('data', onData);
+    process.stdin.once('end', onEnd);
+    process.stdin.once('error', onError);
+    process.stdin.resume();
+  });
+}
+
+function isPluginDirectory(dirPath) {
+  const normDir = normalizeWorkspacePath(path.resolve(dirPath));
+  const normPluginRoot = normalizeWorkspacePath(PLUGIN_ROOT);
+  const normSkillRoot = normalizeWorkspacePath(SKILL_ROOT);
+  return Boolean(normDir && (normDir === normPluginRoot || normDir === normSkillRoot));
+}
+
+export function resolveAutostartProject(args = {}, cwd = process.cwd(), stdinPayload = null) {
+  const fromPayloadRoot =
+    Array.isArray(stdinPayload?.workspace_roots) &&
+    typeof stdinPayload.workspace_roots[0] === 'string' &&
+    stdinPayload.workspace_roots[0].trim();
+  const fromPayloadProject =
+    typeof stdinPayload?.project_dir === 'string' && stdinPayload.project_dir.trim();
+  const fromPayloadCwd =
+    typeof stdinPayload?.cwd === 'string' && stdinPayload.cwd.trim();
+
   const rawExplicit =
     (typeof args?.project === 'string' && args.project.trim()) ||
     (typeof process.env.ANTIGRAVITY_PROJECT_DIR === 'string' && process.env.ANTIGRAVITY_PROJECT_DIR.trim()) ||
+    (typeof process.env.ANTIGRAVITY_WORKSPACE_DIR === 'string' && process.env.ANTIGRAVITY_WORKSPACE_DIR.trim()) ||
     (typeof process.env.PROJECT_DIR === 'string' && process.env.PROJECT_DIR.trim()) ||
+    (typeof process.env.WORKSPACE_DIR === 'string' && process.env.WORKSPACE_DIR.trim()) ||
     (typeof process.env.WORKSPACE_FOLDER === 'string' && process.env.WORKSPACE_FOLDER.trim()) ||
+    fromPayloadRoot ||
+    fromPayloadProject ||
     '';
 
   if (rawExplicit) {
     return { skip: false, projectDir: path.resolve(rawExplicit) };
   }
 
-  const normCwd = normalizeWorkspacePath(path.resolve(cwd));
-  const normPluginRoot = normalizeWorkspacePath(PLUGIN_ROOT);
-  const normSkillRoot = normalizeWorkspacePath(SKILL_ROOT);
-  if (normCwd && (normCwd === normPluginRoot || normCwd === normSkillRoot)) {
+  if (fromPayloadCwd) {
+    if (isPluginDirectory(fromPayloadCwd)) {
+      return { skip: true, reason: 'plugin-root' };
+    }
+    return { skip: false, projectDir: path.resolve(fromPayloadCwd) };
+  }
+
+  if (isPluginDirectory(cwd)) {
     return { skip: true, reason: 'plugin-root' };
   }
 
@@ -1102,7 +1355,8 @@ export function resolveAutostartProject(args = {}, cwd = process.cwd()) {
 
 async function handleAutostart(args) {
   try {
-    const resolved = resolveAutostartProject(args, process.cwd());
+    const stdinPayload = await readHookStdinJson(50);
+    const resolved = resolveAutostartProject(args, process.cwd(), stdinPayload);
     if (resolved.skip) {
       return 0;
     }

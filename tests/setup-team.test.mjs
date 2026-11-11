@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
@@ -91,6 +91,47 @@ async function runKantorCli(args, envOverrides = {}, cwd = WORKTREE_ROOT) {
     windowsHide: true,
     timeout: 20_000,
     maxBuffer: 2 * 1024 * 1024,
+  });
+}
+
+function runKantorCliWithStdin(args, { stdinText = '', closeStdin = true, envOverrides = {}, cwd = WORKTREE_ROOT } = {}) {
+  const env = { ...process.env };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    if (v === undefined || v === null) delete env[k];
+    else env[k] = String(v);
+  }
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [KANTOR_BIN, ...args], {
+      cwd,
+      env,
+      windowsHide: true,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const outChunks = [];
+    const errChunks = [];
+    child.stdout.on('data', (c) => outChunks.push(c));
+    child.stderr.on('data', (c) => errChunks.push(c));
+    child.once('error', reject);
+    const timer = setTimeout(() => {
+      try {
+        child.kill('SIGKILL');
+      } catch {}
+      reject(new Error(`runKantorCliWithStdin timed out for ${args.join(' ')}`));
+    }, 20_000);
+    child.once('close', (code) => {
+      clearTimeout(timer);
+      resolve({
+        code,
+        stdout: Buffer.concat(outChunks).toString('utf8'),
+        stderr: Buffer.concat(errChunks).toString('utf8'),
+      });
+    });
+    if (stdinText) {
+      child.stdin.write(stdinText);
+    }
+    if (closeStdin) {
+      child.stdin.end();
+    }
   });
 }
 
@@ -284,6 +325,22 @@ describe('Task 9: rules/AGENTS.md, IT specialist templates, setupTeam, and CLI l
       const res4 = mod.setupTeam({});
       assert.equal(res4.configDir, envConfigDir);
       assert.deepEqual(res4.copied, EXPECTED_AGENT_FILES);
+
+      // 5. Symlink defense: force: true unlinks symlinked destination instead of writing through to external target
+      const canaryPath = path.join(tmpRoot, 'canary-outside.txt');
+      fs.writeFileSync(canaryPath, 'ORIGINAL CANARY', 'utf8');
+      const symlinkTarget = path.join(res1.agentsDir, 'frontend-ui-dev.md');
+      fs.rmSync(symlinkTarget, { force: true });
+      let symlinkCreated = false;
+      try {
+        fs.symlinkSync(canaryPath, symlinkTarget, 'file');
+        symlinkCreated = true;
+      } catch {}
+      if (symlinkCreated) {
+        mod.setupTeam({ configDir, resourcesDir: AGENTS_RESOURCES_DIR, force: true });
+        assert.equal(fs.lstatSync(symlinkTarget).isSymbolicLink(), false, 'symlink target must be replaced with regular file');
+        assert.equal(fs.readFileSync(canaryPath, 'utf8'), 'ORIGINAL CANARY', 'outside symlink target must never be overwritten');
+      }
     } finally {
       if (prevEnv === undefined) delete process.env.ANTIGRAVITY_CONFIG_DIR;
       else process.env.ANTIGRAVITY_CONFIG_DIR = prevEnv;
@@ -500,19 +557,20 @@ describe('Task 9: rules/AGENTS.md, IT specialist templates, setupTeam, and CLI l
     const projectDir = path.join(tmpRoot, 'proj');
     const storageDir = path.join(tmpRoot, 'storage');
     const agyHome = path.join(tmpRoot, 'agy-home');
-    fs.mkdirSync(projectDir, { recursive: true });
-    fs.mkdirSync(storageDir, { recursive: true });
-    fs.mkdirSync(agyHome, { recursive: true });
-
-    const blocker = net.createServer();
-    await new Promise((resolve, reject) => {
-      blocker.once('error', reject);
-      blocker.listen({ port: 0, host: '127.0.0.1', exclusive: true }, resolve);
-    });
-    const blockedPort = blocker.address().port;
     const env = { KANTOR_STORAGE: storageDir, ANTIGRAVITY_HOME: agyHome };
+    const blocker = net.createServer();
 
     try {
+      fs.mkdirSync(projectDir, { recursive: true });
+      fs.mkdirSync(storageDir, { recursive: true });
+      fs.mkdirSync(agyHome, { recursive: true });
+
+      await new Promise((resolve, reject) => {
+        blocker.once('error', reject);
+        blocker.listen({ port: 0, host: '127.0.0.1', exclusive: true }, resolve);
+      });
+      const blockedPort = blocker.address().port;
+
       const res = await runKantorCli(
         ['start', '--project', projectDir, '--storage', storageDir, '--port', String(blockedPort)],
         env
@@ -531,7 +589,10 @@ describe('Task 9: rules/AGENTS.md, IT specialist templates, setupTeam, and CLI l
         const meta = JSON.parse(fs.readFileSync(path.join(storageDir, 'server.json'), 'utf8'));
         killPidBestEffort(meta?.pid);
       } catch {}
-      await new Promise((resolve) => blocker.close(() => resolve()));
+      await new Promise((resolve) => {
+        if (!blocker.listening) return resolve();
+        blocker.close(() => resolve());
+      });
       cleanDir(tmpRoot);
     }
   });
@@ -599,68 +660,125 @@ describe('Task 9: rules/AGENTS.md, IT specialist templates, setupTeam, and CLI l
     }
   });
 
-  it('autostart exits 0 quietly when disabled or when CWD is plugin root without explicit project', async () => {
+  it('autostart supports env vars + stdin workspace_roots payload and skips plugin root safely', async () => {
     const mod = await import('../skills/kantor-agent/runtime/bin/kantor.mjs');
     const skillRoot = path.resolve(WORKTREE_ROOT, 'skills', 'kantor-agent');
 
-    // Unit test resolveAutostartProject precedence and plugin-root guard
-    const prevAgy = process.env.ANTIGRAVITY_PROJECT_DIR;
-    const prevProj = process.env.PROJECT_DIR;
-    const prevWs = process.env.WORKSPACE_FOLDER;
+    // Unit test resolveAutostartProject precedence, stdin payload, and plugin-root guard
+    const envKeys = [
+      'ANTIGRAVITY_PROJECT_DIR',
+      'ANTIGRAVITY_WORKSPACE_DIR',
+      'PROJECT_DIR',
+      'WORKSPACE_DIR',
+      'WORKSPACE_FOLDER',
+    ];
+    const savedEnv = Object.fromEntries(envKeys.map((k) => [k, process.env[k]]));
     try {
-      delete process.env.ANTIGRAVITY_PROJECT_DIR;
-      delete process.env.PROJECT_DIR;
-      delete process.env.WORKSPACE_FOLDER;
+      for (const k of envKeys) delete process.env[k];
       assert.deepEqual(mod.resolveAutostartProject({}, WORKTREE_ROOT), { skip: true, reason: 'plugin-root' });
       assert.deepEqual(mod.resolveAutostartProject({}, skillRoot), { skip: true, reason: 'plugin-root' });
+      assert.deepEqual(
+        mod.resolveAutostartProject({}, WORKTREE_ROOT, { cwd: WORKTREE_ROOT }),
+        { skip: true, reason: 'plugin-root' }
+      );
 
-      process.env.WORKSPACE_FOLDER = os.tmpdir();
-      const wsRes = mod.resolveAutostartProject({}, WORKTREE_ROOT);
-      assert.equal(wsRes.skip, false);
-      assert.equal(wsRes.projectDir, path.resolve(os.tmpdir()));
+      const stdinRootRes = mod.resolveAutostartProject({}, WORKTREE_ROOT, {
+        workspace_roots: [os.tmpdir()],
+      });
+      assert.equal(stdinRootRes.skip, false);
+      assert.equal(stdinRootRes.projectDir, path.resolve(os.tmpdir()));
+
+      process.env.WORKSPACE_FOLDER = path.join(os.tmpdir(), 'wf');
+      assert.equal(mod.resolveAutostartProject({}, WORKTREE_ROOT).projectDir, path.resolve(os.tmpdir(), 'wf'));
+
+      process.env.WORKSPACE_DIR = path.join(os.tmpdir(), 'wd');
+      assert.equal(mod.resolveAutostartProject({}, WORKTREE_ROOT).projectDir, path.resolve(os.tmpdir(), 'wd'));
 
       process.env.PROJECT_DIR = path.join(os.tmpdir(), 'pdir');
       assert.equal(mod.resolveAutostartProject({}, WORKTREE_ROOT).projectDir, path.resolve(os.tmpdir(), 'pdir'));
 
+      process.env.ANTIGRAVITY_WORKSPACE_DIR = path.join(os.tmpdir(), 'agyws');
+      assert.equal(mod.resolveAutostartProject({}, WORKTREE_ROOT).projectDir, path.resolve(os.tmpdir(), 'agyws'));
+
       process.env.ANTIGRAVITY_PROJECT_DIR = path.join(os.tmpdir(), 'agyproj');
       assert.equal(mod.resolveAutostartProject({}, WORKTREE_ROOT).projectDir, path.resolve(os.tmpdir(), 'agyproj'));
     } finally {
-      if (prevAgy === undefined) delete process.env.ANTIGRAVITY_PROJECT_DIR;
-      else process.env.ANTIGRAVITY_PROJECT_DIR = prevAgy;
-      if (prevProj === undefined) delete process.env.PROJECT_DIR;
-      else process.env.PROJECT_DIR = prevProj;
-      if (prevWs === undefined) delete process.env.WORKSPACE_FOLDER;
-      else process.env.WORKSPACE_FOLDER = prevWs;
+      for (const k of envKeys) {
+        if (savedEnv[k] === undefined) delete process.env[k];
+        else process.env[k] = savedEnv[k];
+      }
     }
 
-    // CLI test: autostart from plugin root (WORKTREE_ROOT) with KANTOR_AUTOSTART=1 and no --project/env skips cleanly!
+    // CLI tests:
     const tmpRoot = makeTempDir('kantor-autostart-');
-    const storageDir = path.join(tmpRoot, 'storage');
+    const storagePlugin = path.join(tmpRoot, 'storage-plugin');
+    const storageProj = path.join(tmpRoot, 'storage-proj');
+    const agyHome = path.join(tmpRoot, 'agy-home');
     const projDir = path.join(tmpRoot, 'proj');
     fs.mkdirSync(projDir, { recursive: true });
-    try {
-      const pluginRootRes = await runKantorCli(
-        ['autostart', '--storage', storageDir],
-        {
-          KANTOR_AUTOSTART: '1',
-          KANTOR_STORAGE: storageDir,
-          ANTIGRAVITY_PROJECT_DIR: '',
-          PROJECT_DIR: '',
-          WORKSPACE_FOLDER: '',
-        },
-        WORKTREE_ROOT
-      );
-      assert.equal(pluginRootRes.stdout.trim(), '');
-      assert.equal(fs.existsSync(storageDir), false, 'autostart in plugin root must not create storage or spawn server');
+    fs.mkdirSync(agyHome, { recursive: true });
 
-      // Also verify autostart: false in a regular project directory exits 0 quietly without spawning
-      const disabledRes = await runKantorCli(
-        ['autostart', '--project', projDir, '--storage', storageDir],
-        { KANTOR_AUTOSTART: '' }
+    const port = await findFreePort('127.0.0.1');
+    const clearedProjEnv = {
+      ANTIGRAVITY_PROJECT_DIR: '',
+      ANTIGRAVITY_WORKSPACE_DIR: '',
+      PROJECT_DIR: '',
+      WORKSPACE_DIR: '',
+      WORKSPACE_FOLDER: '',
+      ANTIGRAVITY_HOME: agyHome,
+    };
+
+    try {
+      // 1. autostart from plugin root with KANTOR_AUTOSTART=1 and no --project/env/stdin skips cleanly (even with unclosed stdin!)
+      const pluginRootRes = await runKantorCliWithStdin(['autostart', '--storage', storagePlugin], {
+        closeStdin: false,
+        envOverrides: {
+          ...clearedProjEnv,
+          KANTOR_AUTOSTART: '1',
+          KANTOR_STORAGE: storagePlugin,
+        },
+        cwd: WORKTREE_ROOT,
+      });
+      assert.equal(pluginRootRes.code, 0);
+      assert.equal(pluginRootRes.stdout.trim(), '');
+      assert.equal(fs.existsSync(storagePlugin), false, 'autostart in plugin root must not create storage or spawn server');
+
+      // 2. autostart with stdin JSON payload { workspace_roots: [projDir] } when autostart: false exits 0 quietly without starting
+      const disabledStdinRes = await runKantorCliWithStdin(
+        ['autostart', '--storage', storageProj],
+        {
+          stdinText: JSON.stringify({ workspace_roots: [projDir] }),
+          closeStdin: true,
+          envOverrides: { ...clearedProjEnv, KANTOR_AUTOSTART: '', KANTOR_STORAGE: storageProj },
+          cwd: WORKTREE_ROOT,
+        }
       );
-      assert.equal(disabledRes.stdout.trim(), '');
-      assert.equal(fs.existsSync(path.join(storageDir, 'server.json')), false);
+      assert.equal(disabledStdinRes.code, 0);
+      assert.equal(fs.existsSync(path.join(storageProj, 'server.json')), false);
+
+      // 3. autostart with stdin JSON payload { workspace_roots: [projDir] } when KANTOR_AUTOSTART=1 starts server for projDir
+      const activeStdinRes = await runKantorCliWithStdin(
+        ['autostart', '--storage', storageProj, '--port', String(port)],
+        {
+          stdinText: JSON.stringify({ workspace_roots: [projDir] }),
+          closeStdin: true,
+          envOverrides: { ...clearedProjEnv, KANTOR_AUTOSTART: '1', KANTOR_STORAGE: storageProj },
+          cwd: WORKTREE_ROOT,
+        }
+      );
+      assert.equal(activeStdinRes.code, 0);
+      const serverJsonPath = path.join(storageProj, 'server.json');
+      assert.ok(fs.existsSync(serverJsonPath), 'autostart with stdin workspace_roots and KANTOR_AUTOSTART=1 should start server');
+      const meta = JSON.parse(fs.readFileSync(serverJsonPath, 'utf8'));
+      assert.equal(path.resolve(meta.projectDir), path.resolve(projDir));
     } finally {
+      try {
+        await runKantorCli(['stop', '--project', projDir, '--storage', storageProj], clearedProjEnv);
+      } catch {}
+      try {
+        const meta = JSON.parse(fs.readFileSync(path.join(storageProj, 'server.json'), 'utf8'));
+        killPidBestEffort(meta?.pid);
+      } catch {}
       cleanDir(tmpRoot);
     }
   });
@@ -759,6 +877,77 @@ describe('Task 9: rules/AGENTS.md, IT specialist templates, setupTeam, and CLI l
         const sMeta = JSON.parse(fs.readFileSync(path.join(storageDir, 'server.json'), 'utf8'));
         killPidBestEffort(sMeta?.pid);
       } catch {}
+      cleanDir(tmpRoot);
+    }
+  });
+
+  it('PID reuse guard: stop/tunnel-stop clean stale files without killing unrelated live PIDs, and url requires live ping', async () => {
+    const tmpRoot = makeTempDir('kantor-pidreuse-');
+    const projectDir = path.join(tmpRoot, 'proj');
+    const storageDir = path.join(tmpRoot, 'storage');
+    fs.mkdirSync(projectDir, { recursive: true });
+    fs.mkdirSync(storageDir, { recursive: true });
+
+    const unusedPort = await findFreePort('127.0.0.1');
+    const dummy = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 25000)'], {
+      windowsHide: true,
+      stdio: 'ignore',
+    });
+
+    const isAlive = (pid) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    try {
+      assert.ok(isAlive(dummy.pid), 'dummy process must be running');
+
+      const serverJsonPath = path.join(storageDir, 'server.json');
+      const tunnelJsonPath = path.join(storageDir, 'tunnel.json');
+      const tunnelUrlPath = path.join(storageDir, 'tunnel-url.txt');
+
+      fs.writeFileSync(
+        serverJsonPath,
+        JSON.stringify({
+          pid: dummy.pid,
+          port: unusedPort,
+          bind: '127.0.0.1',
+          connectHost: '127.0.0.1',
+          url: `http://127.0.0.1:${unusedPort}/kerja`,
+          projectDir,
+          storageDir,
+        }),
+        'utf8'
+      );
+      fs.writeFileSync(
+        tunnelJsonPath,
+        JSON.stringify({
+          pid: dummy.pid,
+          url: 'https://stale-pid-reuse.trycloudflare.com/kerja',
+          localPort: unusedPort,
+        }),
+        'utf8'
+      );
+      fs.writeFileSync(tunnelUrlPath, 'https://stale-pid-reuse.trycloudflare.com/kerja\n', 'utf8');
+
+      // 1. url must verify live ping (not just processAlive) and fail cleanly when port does not respond
+      await assert.rejects(
+        () => runKantorCli(['url', '--project', projectDir, '--storage', storageDir], { KANTOR_STORAGE: storageDir }),
+        (err) => err && err.code === 1
+      );
+
+      // 2. stop cleans stale server.json, tunnel.json, and tunnel-url.txt WITHOUT killing the unrelated dummy PID!
+      await runKantorCli(['stop', '--project', projectDir, '--storage', storageDir], { KANTOR_STORAGE: storageDir });
+      assert.equal(fs.existsSync(serverJsonPath), false, 'stale server.json must be cleaned');
+      assert.equal(fs.existsSync(tunnelJsonPath), false, 'stale tunnel.json must be cleaned');
+      assert.equal(fs.existsSync(tunnelUrlPath), false, 'stale tunnel-url.txt must be cleaned');
+      assert.equal(isAlive(dummy.pid), true, 'unrelated dummy process PID must NOT be killed on PID reuse');
+    } finally {
+      killPidBestEffort(dummy.pid);
       cleanDir(tmpRoot);
     }
   });
