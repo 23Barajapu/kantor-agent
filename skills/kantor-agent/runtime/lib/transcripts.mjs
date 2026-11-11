@@ -371,7 +371,7 @@ export function isCliMain(row) {
   if (!row || row.nesting_depth !== 0 || row.parent_conversation_id) return false;
   if (row.app_data_dir === 'antigravity-cli') return true;
   const sourceUpper = String(row.source || '').toUpperCase();
-  if (sourceUpper === 'CORTEX_TRAJECTORY_SOURCE_CLI' || sourceUpper.includes('CLI')) return true;
+  if (sourceUpper === 'CORTEX_TRAJECTORY_SOURCE_CLI' || /(?:^|_)CLI(?:$|_)/.test(sourceUpper)) return true;
   const dbRootClean = String(row.dbRoot || '')
     .replace(/[\\/]+$/, '')
     .replaceAll('\\', '/')

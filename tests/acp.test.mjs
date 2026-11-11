@@ -9,6 +9,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { pathToFileURL } from 'node:url';
 
 import { AcpBridge } from '../skills/kantor-agent/runtime/lib/acp.mjs';
+import { isCliMain } from '../skills/kantor-agent/runtime/lib/transcripts.mjs';
 import { createKantorServer } from '../skills/kantor-agent/runtime/bin/serve.mjs';
 import { loadConfig } from '../skills/kantor-agent/runtime/lib/config.mjs';
 
@@ -635,7 +636,7 @@ describe('AcpBridge (lib/acp.mjs)', () => {
       assert.equal(bridgeVal.getStatus().sessionId, null);
       assert.equal(bridgeVal.child, null);
 
-      // 2. createSession({ mode, model }) sends session/set_mode only ONCE + session/prompt ignores rpcTimeoutMs (250ms > 120ms)
+      // 2. createSession({ mode, model }) sends session/set_mode only ONCE + session/prompt ignores rpcTimeoutMs (1400ms > 1200ms)
       const created = await bridgeVal.createSession({ mode: 'plan', model: 'gemini-2.5-pro' });
       assert.equal(created.ok, true);
       assert.equal(created.mode, 'plan');
@@ -673,7 +674,7 @@ describe('AcpBridge (lib/acp.mjs)', () => {
 
       // 5. Windows .cmd wrapper execution via ComSpec & metacharacter rejection (only on win32)
       if (process.platform === 'win32') {
-        const cmdPath = path.join(dir, 'agy wrapper.cmd');
+        const cmdPath = path.join(dir, 'agy (x86) wrapper.cmd');
         fs.writeFileSync(cmdPath, `@echo off\r\n"${process.execPath}" "${FAKE_AGY}" %*\r\n`, 'utf8');
         const bridgeCmd = new AcpBridge({
           projectDir: dir,
@@ -688,13 +689,15 @@ describe('AcpBridge (lib/acp.mjs)', () => {
           await bridgeCmd.shutdown();
         }
 
-        const unsafeCmdBridge = new AcpBridge({
-          projectDir: dir,
-          agyBin: path.join(dir, 'agy&calc.cmd'),
-        });
-        await assert.rejects(() => unsafeCmdBridge.createSession(), /tidak aman/);
-        assert.equal(unsafeCmdBridge.child, null);
-        await unsafeCmdBridge.shutdown();
+        for (const badCmdName of ['agy&calc.cmd', 'agy;calc.cmd', 'agy=val.cmd']) {
+          const unsafeCmdBridge = new AcpBridge({
+            projectDir: dir,
+            agyBin: path.join(dir, badCmdName),
+          });
+          await assert.rejects(() => unsafeCmdBridge.createSession(), /tidak aman/);
+          assert.equal(unsafeCmdBridge.child, null);
+          await unsafeCmdBridge.shutdown();
+        }
       }
 
       // 6. Multi-byte UTF-8 split across chunks & trailing NDJSON frame with UTF-8 emitted right before stdout close
@@ -781,7 +784,7 @@ describe('AcpBridge (lib/acp.mjs)', () => {
         await bridgeRace.shutdown();
       }
 
-      // 8. Mid-startup cancellation in sendPrompt() aborts before pushing history or dispatching session/prompt
+      // 8. Mid-startup cancellation in sendPrompt() aborts cleanly without pushing history or overwriting lastError
       process.env.FAKE_AGY_SLOW_NEW_MS = '220';
       const bridgeStartupCancel = new AcpBridge({ projectDir: dir, agyBin: FAKE_AGY });
       try {
@@ -790,6 +793,7 @@ describe('AcpBridge (lib/acp.mjs)', () => {
         await bridgeStartupCancel.cancelTurn();
         await assert.rejects(() => sendPromise, (err) => err?.status === 409);
         assert.equal(bridgeStartupCancel.getStatus().busy, false);
+        assert.equal(bridgeStartupCancel.getStatus().lastError, null);
         assert.equal(
           bridgeStartupCancel.getHistory().some((h) => h.role === 'user' && h.text === 'Jangan pernah dikirim'),
           false
@@ -798,6 +802,42 @@ describe('AcpBridge (lib/acp.mjs)', () => {
         if (prevSlowNew === undefined) delete process.env.FAKE_AGY_SLOW_NEW_MS;
         else process.env.FAKE_AGY_SLOW_NEW_MS = prevSlowNew;
         await bridgeStartupCancel.shutdown();
+      }
+
+      // 9. isCliMain rejects false-positive 'CLIENT' source & late close on stale child1 does not clobber child2
+      assert.equal(
+        isCliMain({ nesting_depth: 0, source: 'CORTEX_TRAJECTORY_SOURCE_CLIENT', app_data_dir: 'antigravity', dbRoot: '/x/antigravity' }),
+        false
+      );
+      assert.equal(
+        isCliMain({ nesting_depth: 0, source: 'CORTEX_TRAJECTORY_SOURCE_CLI', app_data_dir: 'antigravity', dbRoot: '/x/antigravity' }),
+        true
+      );
+      assert.equal(
+        isCliMain({ nesting_depth: 0, source: 'ACP_CLI', app_data_dir: 'antigravity', dbRoot: '/x/antigravity' }),
+        true
+      );
+
+      const bridgeLateClose = new AcpBridge({ projectDir: dir, agyBin: FAKE_AGY });
+      try {
+        await bridgeLateClose.createSession();
+        const child1 = bridgeLateClose.child;
+        const child2 = new EventEmitter();
+        bridgeLateClose.child = child2;
+        bridgeLateClose._boundChild = child2;
+        bridgeLateClose.connected = true;
+        bridgeLateClose.sessionId = 'sess-child-2';
+
+        bridgeLateClose._handleChildExit(child1, 'stale error', true);
+        assert.equal(bridgeLateClose.child, child2);
+        assert.equal(bridgeLateClose._boundChild, child2);
+        assert.equal(bridgeLateClose.connected, true);
+        assert.equal(bridgeLateClose.sessionId, 'sess-child-2');
+        assert.equal(bridgeLateClose.lastError, null);
+        // Restore child1 so shutdown cleans up the real child cleanly
+        bridgeLateClose.child = child1;
+      } finally {
+        await bridgeLateClose.shutdown();
       }
     } finally {
       if (prevRpcLog === undefined) delete process.env.FAKE_AGY_RPC_LOG;

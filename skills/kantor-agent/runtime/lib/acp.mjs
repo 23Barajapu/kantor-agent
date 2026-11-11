@@ -5,7 +5,7 @@ import { isFile, isPlainObj, isoMs } from './util.mjs';
 
 const VALID_MODES = new Set(['plan', 'accept-edits', 'auto']);
 const ALLOWED_STATIC_ACP_ARGS = new Set(['acp', '--stdio', '--sandbox']);
-const CMD_UNSAFE_RE = /[\x00-\x1f\x7f"&|<>^%!]/;
+const CMD_UNSAFE_RE = /[\x00-\x1f\x7f"&|<>^%!;=]/;
 const MAX_HISTORY = 200;
 const MAX_STDOUT_LINE_BYTES = 4 * 1024 * 1024;
 const DEFAULT_RPC_TIMEOUT_MS = 30_000;
@@ -59,14 +59,16 @@ function resolveWindowsBinary(agyBin) {
   const exts = ['.exe', ...rawPathext.filter((e) => e !== '.exe')];
 
   if (hasSep) {
+    if (path.extname(raw) === '') {
+      for (const ext of exts) {
+        const cand = `${raw}${ext}`;
+        if (isFile(cand)) {
+          return { kind: ext === '.cmd' || ext === '.bat' ? 'cmd' : 'direct', bin: cand };
+        }
+      }
+    }
     if (isFile(raw)) {
       return { kind: 'direct', bin: raw };
-    }
-    for (const ext of exts) {
-      const cand = `${raw}${ext}`;
-      if (isFile(cand)) {
-        return { kind: ext === '.cmd' || ext === '.bat' ? 'cmd' : 'direct', bin: cand };
-      }
     }
     return { kind: 'direct', bin: raw };
   }
@@ -76,8 +78,8 @@ function resolveWindowsBinary(agyBin) {
     .map((d) => d.trim().replace(/^"+|"+$/g, ''))
     .filter(Boolean);
 
-  for (const ext of exts) {
-    for (const dir of pathDirs) {
+  for (const dir of pathDirs) {
+    for (const ext of exts) {
       const cand = path.join(dir, `${raw}${ext}`);
       if (isFile(cand)) {
         return { kind: ext === '.cmd' || ext === '.bat' ? 'cmd' : 'direct', bin: cand };
@@ -711,17 +713,20 @@ export class AcpBridge {
   }
 
   _handleChildExit(child, errMessage, isError) {
-    if (this.child === child) {
-      this.child = null;
-      this._boundChild = null;
-      this._spawnedViaCmd = false;
-      this.connected = false;
-      this.busy = false;
-      this.sessionId = null;
-      this._initResult = null;
-    } else if (this._boundChild === child) {
-      this._boundChild = null;
+    if (this.child !== child) {
+      if (this._boundChild === child) {
+        this._boundChild = null;
+      }
+      return;
     }
+
+    this.child = null;
+    this._boundChild = null;
+    this._spawnedViaCmd = false;
+    this.connected = false;
+    this.busy = false;
+    this.sessionId = null;
+    this._initResult = null;
 
     if (isError && errMessage && !this.shuttingDown) {
       this.lastError = errMessage;
@@ -740,7 +745,24 @@ export class AcpBridge {
     }
   }
 
+  _resetDeadChildBeforeRespawn() {
+    if (this.child && (this.child.exitCode !== null || this.child.signalCode !== null)) {
+      this.child = null;
+      this._boundChild = null;
+      this._spawnedViaCmd = false;
+      this.connected = false;
+      this.busy = false;
+      this.sessionId = null;
+      this._initResult = null;
+      this._failAllPending(new Error('Proses ACP sebelumnya telah berhenti'), {
+        writePermissionCancel: false,
+        permissionEventName: null,
+      });
+    }
+  }
+
   _spawnChild() {
+    this._resetDeadChildBeforeRespawn();
     const spec = this._resolveSpawnSpec();
 
     this._stdoutDecoder = new StringDecoder('utf8');
@@ -791,6 +813,7 @@ export class AcpBridge {
     });
 
     child.stderr?.on('data', (chunk) => {
+      if (this.child !== child) return;
       const combined = this._lastStderr + String(chunk);
       this._lastStderr = combined.slice(-512);
     });
@@ -821,7 +844,20 @@ export class AcpBridge {
       return;
     }
 
+    const isCmdChild = process.platform === 'win32' && Boolean(child._viaCmd || this._spawnedViaCmd);
+    const killCmdTree = () => {
+      if (isCmdChild && Number.isInteger(child.pid)) {
+        const killer = spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], {
+          windowsHide: true,
+          stdio: 'ignore',
+        });
+        killer.on('error', () => {});
+        killer.unref();
+      }
+    };
+
     if (child.exitCode !== null || child.signalCode !== null) {
+      killCmdTree();
       if (this.child === child) {
         this.child = null;
         this._boundChild = null;
@@ -862,24 +898,20 @@ export class AcpBridge {
       try {
         child.stdin?.end();
       } catch {}
-      try {
-        child.kill('SIGTERM');
-      } catch {
-        finish();
-        return;
+
+      if (!isCmdChild) {
+        try {
+          child.kill('SIGTERM');
+        } catch {
+          finish();
+          return;
+        }
       }
 
       killTimer = setTimeout(() => {
         try {
+          killCmdTree();
           if (child.exitCode === null && child.signalCode === null) {
-            if (process.platform === 'win32' && (child._viaCmd || this._spawnedViaCmd) && Number.isInteger(child.pid)) {
-              const killer = spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], {
-                windowsHide: true,
-                stdio: 'ignore',
-              });
-              killer.on('error', () => {});
-              killer.unref();
-            }
             child.kill('SIGKILL');
           }
         } catch {}
@@ -1186,10 +1218,14 @@ export class AcpBridge {
         this.busy = false;
         this._turnPromise = null;
         if (this.shuttingDown) {
-          throw httpError(503, 'Jembatan ACP sedang dimatikan', { publicSafe: true });
+          throw Object.assign(httpError(503, 'Jembatan ACP sedang dimatikan', { publicSafe: true }), {
+            _cancelledMidStartup: true,
+          });
         }
         this._broadcastSse('status', this.getStatus());
-        throw httpError(409, 'Giliran dibatalkan saat memulai sesi');
+        throw Object.assign(httpError(409, 'Giliran dibatalkan saat memulai sesi'), {
+          _cancelledMidStartup: true,
+        });
       }
 
       const activeSessionId = this.sessionId;
@@ -1260,8 +1296,12 @@ export class AcpBridge {
     } catch (err) {
       this.busy = false;
       this._turnPromise = null;
-      this.lastError = err?.message || 'Gagal mengirim prompt ke ACP';
-      this._broadcastSse('status', this.getStatus());
+      const wasCancelled =
+        Boolean(err?._cancelledMidStartup) || this.shuttingDown || turnEpoch !== this._turnEpoch;
+      if (!wasCancelled) {
+        this.lastError = err?.message || 'Gagal mengirim prompt ke ACP';
+        this._broadcastSse('status', this.getStatus());
+      }
       throw err;
     }
   }
