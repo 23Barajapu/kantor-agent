@@ -21,6 +21,7 @@ import { loadConfig } from '../skills/kantor-agent/runtime/lib/config.mjs';
 import { isInsideDir } from '../skills/kantor-agent/runtime/lib/util.mjs';
 
 const RUNTIME_DIR = path.resolve(import.meta.dirname, '..', 'skills', 'kantor-agent', 'runtime');
+const FAKE_AGY = path.resolve(import.meta.dirname, 'fixtures', 'fake-agy.mjs');
 
 const SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS conversation_summaries (
@@ -969,6 +970,191 @@ describe('serve.mjs HTTP server, security & routes', () => {
       });
       assert.equal(notFound.status, 404);
       assertApiErrorHeaders(notFound);
+    } finally {
+      await stopServer(noBridgeSrv.server);
+      cleanDir(env.base);
+    }
+  });
+
+  it('exposes authenticated GET /kerja/api/chat/models with refresh support and safe degradation', async () => {
+    const env = createTestEnv();
+    const cfg = loadConfig(RUNTIME_DIR, env.projectDir);
+
+    // 1. GET /kerja/api/chat/models without auth from non-loopback -> 401
+    const mainSrv = await startServer({
+      projectDir: env.projectDir,
+      runtimeDir: RUNTIME_DIR,
+      storageDir: env.storageDir,
+      cfg,
+      agyBin: FAKE_AGY,
+    });
+    try {
+      const port = mainSrv.port;
+      const token = mainSrv.server.authManager.getToken();
+
+      const unauthNonLoopback = await rawRequest(port, {
+        method: 'GET',
+        reqPath: '/kerja/api/chat/models',
+        headers: {
+          Host: `127.0.0.1:${port}`,
+          'X-Forwarded-For': '198.51.100.1',
+        },
+      });
+      assert.equal(unauthNonLoopback.status, 401);
+      assert.equal(unauthNonLoopback.json?.ok, false);
+      assertApiErrorHeaders(unauthNonLoopback);
+
+      // 2. POST /kerja/api/chat/models -> 405 with Allow: GET
+      const postMethodRes = await rawRequest(port, {
+        method: 'POST',
+        reqPath: '/kerja/api/chat/models',
+        headers: {
+          Host: `127.0.0.1:${port}`,
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: {},
+      });
+      assert.equal(postMethodRes.status, 405);
+      assert.equal(postMethodRes.headers['allow'], 'GET');
+      assertApiErrorHeaders(postMethodRes);
+
+      // 3. Authenticated GET /kerja/api/chat/models returns 200 JSON with models and security headers
+      const okRes = await rawRequest(port, {
+        method: 'GET',
+        reqPath: '/kerja/api/chat/models',
+        headers: {
+          Host: `127.0.0.1:${port}`,
+          Authorization: `Bearer ${token}`,
+        },
+      });
+      assert.equal(okRes.status, 200);
+      assert.equal(okRes.headers['cache-control'], 'no-store');
+      assert.equal(okRes.headers['x-content-type-options'], 'nosniff');
+      assert.equal(okRes.json?.ok, true);
+      assert.equal(okRes.json?.source, 'agy-models');
+      assert.equal(okRes.json?.cached, false);
+      assert.equal(okRes.json?.degraded, false);
+      assert.ok(Array.isArray(okRes.json?.models));
+      assert.ok(okRes.json.models.length >= 2);
+      assert.ok(okRes.json.models.some((m) => m.id === 'gemini-2.5-pro' && m.name === 'Gemini 2.5 Pro'));
+      assert.equal(okRes.json?.error, undefined);
+    } finally {
+      await stopServer(mainSrv.server);
+    }
+
+    // 4. When cfg.chat.enabled === false -> 503
+    const disabledCfg = { ...cfg, chat: { ...cfg.chat, enabled: false } };
+    const disabledSrv = await startServer({
+      projectDir: env.projectDir,
+      runtimeDir: RUNTIME_DIR,
+      storageDir: env.storageDir,
+      cfg: disabledCfg,
+    });
+    try {
+      const resDisabled = await rawRequest(disabledSrv.port, {
+        method: 'GET',
+        reqPath: '/kerja/api/chat/models',
+        headers: { Host: `127.0.0.1:${disabledSrv.port}` },
+      });
+      assert.equal(resDisabled.status, 503);
+      assert.equal(resDisabled.json?.ok, false);
+      assertApiErrorHeaders(resDisabled);
+    } finally {
+      await stopServer(disabledSrv.server);
+    }
+
+    // 5. GET /kerja/api/chat/models?refresh=1 forwards { force: true } to acpBridge.listModels
+    const bridgeCalls = [];
+    const trackingBridge = {
+      listModels: async (opts) => {
+        bridgeCalls.push(opts);
+        return {
+          ok: true,
+          models: [{ id: 'mock-model', name: 'Mock Model' }],
+          source: opts?.force ? 'agy-models' : 'cache',
+          cached: !opts?.force,
+          degraded: false,
+          error: null,
+        };
+      },
+    };
+    const trackingSrv = await startServer({
+      projectDir: env.projectDir,
+      runtimeDir: RUNTIME_DIR,
+      storageDir: env.storageDir,
+      cfg,
+      acpBridge: trackingBridge,
+    });
+    try {
+      const tToken = trackingSrv.server.authManager.getToken();
+
+      const normalRes = await rawRequest(trackingSrv.port, {
+        method: 'GET',
+        reqPath: '/kerja/api/chat/models',
+        headers: { Host: `127.0.0.1:${trackingSrv.port}`, Authorization: `Bearer ${tToken}` },
+      });
+      assert.equal(normalRes.status, 200);
+      assert.deepEqual(bridgeCalls[0], { force: false });
+
+      const refreshRes = await rawRequest(trackingSrv.port, {
+        method: 'GET',
+        reqPath: '/kerja/api/chat/models?refresh=1',
+        headers: { Host: `127.0.0.1:${trackingSrv.port}`, Authorization: `Bearer ${tToken}` },
+      });
+      assert.equal(refreshRes.status, 200);
+      assert.deepEqual(bridgeCalls[1], { force: true });
+    } finally {
+      await stopServer(trackingSrv.server);
+    }
+
+    // 6. When agyBin is missing (ENOENT), returns 200 { ok: false, degraded: true, models: [], error }
+    // without leaking filesystem path (err path absent from body)
+    const missingBinPath = path.join(env.base, 'nonexistent-agy-binary');
+    const missingBinSrv = await startServer({
+      projectDir: env.projectDir,
+      runtimeDir: RUNTIME_DIR,
+      storageDir: env.storageDir,
+      cfg,
+      agyBin: missingBinPath,
+    });
+    try {
+      const mToken = missingBinSrv.server.authManager.getToken();
+      const missingRes = await rawRequest(missingBinSrv.port, {
+        method: 'GET',
+        reqPath: '/kerja/api/chat/models',
+        headers: { Host: `127.0.0.1:${missingBinSrv.port}`, Authorization: `Bearer ${mToken}` },
+      });
+      assert.equal(missingRes.status, 200);
+      assert.equal(missingRes.json?.ok, false);
+      assert.equal(missingRes.json?.degraded, true);
+      assert.deepEqual(missingRes.json?.models, []);
+      assert.equal(missingRes.json?.source, 'error');
+      assert.ok(typeof missingRes.json?.error === 'string' && missingRes.json.error.length > 0);
+      assert.equal(missingRes.text.includes(missingBinPath), false, 'err path must not leak');
+      assert.equal(missingRes.text.includes(env.base), false, 'base dir must not leak');
+    } finally {
+      await stopServer(missingBinSrv.server);
+    }
+
+    // 7. When acpBridge is null / missing listModels -> 503
+    const noBridgeSrv = await startServer({
+      projectDir: env.projectDir,
+      runtimeDir: RUNTIME_DIR,
+      storageDir: env.storageDir,
+      cfg,
+      acpBridge: null,
+    });
+    try {
+      const nbToken = noBridgeSrv.server.authManager.getToken();
+      const nbRes = await rawRequest(noBridgeSrv.port, {
+        method: 'GET',
+        reqPath: '/kerja/api/chat/models',
+        headers: { Host: `127.0.0.1:${noBridgeSrv.port}`, Authorization: `Bearer ${nbToken}` },
+      });
+      assert.equal(nbRes.status, 503);
+      assert.equal(nbRes.json?.ok, false);
+      assertApiErrorHeaders(nbRes);
     } finally {
       await stopServer(noBridgeSrv.server);
       cleanDir(env.base);

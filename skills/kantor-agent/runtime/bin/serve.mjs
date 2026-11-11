@@ -292,7 +292,18 @@ function handleArtifact(req, res, url, { projectDir, cfg }) {
   });
 }
 
-async function handleChat(req, res, pathname, method, { cfg, authManager, acpBridge }) {
+async function handleChat(req, res, pathname, method, urlOrOpts, maybeOpts) {
+  let url = urlOrOpts instanceof URL ? urlOrOpts : null;
+  let opts = (url ? maybeOpts : urlOrOpts) || {};
+  if (!url) {
+    try {
+      url = new URL(req.url || '/', 'http://localhost');
+    } catch {
+      url = null;
+    }
+  }
+  const { cfg, authManager, acpBridge } = opts;
+
   if (cfg?.chat?.enabled === false) {
     return sendJson(res, 503, { ok: false, error: 'Chat dinonaktifkan oleh konfigurasi' });
   }
@@ -360,6 +371,43 @@ async function handleChat(req, res, pathname, method, { cfg, authManager, acpBri
     res.setHeader('Connection', 'keep-alive');
     await acpBridge.subscribeSse(req, res);
     return;
+  }
+
+  if (pathname === '/kerja/api/chat/models') {
+    if (method !== 'GET') {
+      return sendJson(res, 405, { ok: false, error: 'Metode tidak diizinkan' }, { Allow: 'GET' });
+    }
+    if (!authManager.isAuthorized(req)) {
+      return sendJson(res, 401, { ok: false, error: 'Autentikasi chat diperlukan' });
+    }
+    if (typeof acpBridge?.listModels !== 'function') {
+      return sendJson(res, 503, { ok: false, error: 'Jembatan ACP belum tersedia' });
+    }
+
+    const force = url?.searchParams?.get('refresh') === '1';
+    try {
+      const result = await acpBridge.listModels({ force });
+      const payload = {
+        ok: result?.ok === true,
+        models: Array.isArray(result?.models) ? result.models : [],
+        source: typeof result?.source === 'string' ? result.source : 'error',
+        cached: result?.cached === true,
+        degraded: result?.degraded === true,
+      };
+      if (result?.error !== null && result?.error !== undefined) {
+        payload.error = String(result.error);
+      }
+      return sendJson(res, 200, payload);
+    } catch {
+      return sendJson(res, 200, {
+        ok: false,
+        models: [],
+        source: 'error',
+        cached: false,
+        degraded: true,
+        error: 'Gagal memuat model',
+      });
+    }
   }
 
   const actionName = CHAT_ACTION_METHODS[pathname];
@@ -524,7 +572,7 @@ export function createKantorServer(opts = {}) {
       }
 
       if (pathname.startsWith('/kerja/api/chat/')) {
-        return await handleChat(req, res, pathname, method, { cfg, authManager, acpBridge });
+        return await handleChat(req, res, pathname, method, url, { cfg, authManager, acpBridge });
       }
 
       return sendJson(res, 404, { ok: false, error: 'Tidak ditemukan' });
