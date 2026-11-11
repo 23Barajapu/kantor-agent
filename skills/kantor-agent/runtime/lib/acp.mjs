@@ -1031,7 +1031,7 @@ export class AcpBridge {
     this.mode = targetMode;
     this.model = targetModel;
 
-    this._pushHistory({
+    const sessionEntry = this._pushHistory({
       type: 'session',
       action: 'new',
       sessionId: this.sessionId,
@@ -1039,6 +1039,7 @@ export class AcpBridge {
       model: this.model,
     });
     this._broadcastSse('session', {
+      id: sessionEntry.id,
       action: 'new',
       sessionId: this.sessionId,
       mode: this.mode,
@@ -1127,7 +1128,7 @@ export class AcpBridge {
       this.sessionId = sessionId;
       this._boundChild = this.child;
 
-      this._pushHistory({
+      const sessionEntry = this._pushHistory({
         type: 'session',
         action: 'load',
         sessionId: this.sessionId,
@@ -1135,6 +1136,7 @@ export class AcpBridge {
         model: this.model,
       });
       this._broadcastSse('session', {
+        id: sessionEntry.id,
         action: 'load',
         sessionId: this.sessionId,
         mode: this.mode,

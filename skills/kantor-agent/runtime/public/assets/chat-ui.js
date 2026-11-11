@@ -9,6 +9,32 @@ const HTML_ESCAPE_MAP = {
   "'": '&#39;',
 };
 
+export const DEFAULT_COLORS = Object.freeze({
+  ketua: '#6a55c9',
+  team: ['#3f6fd1', '#2f9a6d', '#d9772f', '#c2417a'],
+  freelancers: ['#0f8fa3', '#9a7418', '#4f7d3a', '#8a4fa8', '#3d7f9e', '#b8452f'],
+});
+
+export function normalizeColors(rawColors) {
+  const src = rawColors && typeof rawColors === 'object' && !Array.isArray(rawColors) ? rawColors : {};
+  const ketua =
+    typeof src.ketua === 'string' && src.ketua.trim() !== ''
+      ? src.ketua.trim()
+      : DEFAULT_COLORS.ketua;
+
+  const rawTeam = Array.isArray(src.team) ? src.team : [];
+  const team = DEFAULT_COLORS.team.map((def, i) =>
+    typeof rawTeam[i] === 'string' && rawTeam[i].trim() !== '' ? rawTeam[i].trim() : def
+  );
+
+  const rawFl = Array.isArray(src.freelancers)
+    ? src.freelancers.filter((c) => typeof c === 'string' && c.trim() !== '').map((c) => c.trim())
+    : [];
+  const freelancers = rawFl.length > 0 ? rawFl : [...DEFAULT_COLORS.freelancers];
+
+  return { ketua, team, freelancers };
+}
+
 export function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) => HTML_ESCAPE_MAP[c]);
 }
@@ -54,6 +80,8 @@ function formatInlineEscaped(escapedText) {
 function renderInlineSafe(rawLine) {
   const clean = String(rawLine ?? '').replace(/\0/g, '');
   const tokens = [];
+  const restoreTokens = (str) => str.replace(/\0TK(\d+)\0/g, (_, i) => tokens[Number(i)] ?? '');
+
   let work = clean.replace(/`([^`]+)`/g, (_, code) => {
     const idx = tokens.length;
     tokens.push(`<code>${esc(code)}</code>`);
@@ -63,7 +91,7 @@ function renderInlineSafe(rawLine) {
   work = work.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_, label, rawHref) => {
     const idx = tokens.length;
     const safeHref = isSafeHref(rawHref);
-    const labelHtml = formatInlineEscaped(esc(label));
+    const labelHtml = restoreTokens(formatInlineEscaped(esc(label)));
     if (safeHref) {
       tokens.push(`<a href="${esc(safeHref)}" target="_blank" rel="noopener noreferrer">${labelHtml}</a>`);
     } else {
@@ -72,9 +100,8 @@ function renderInlineSafe(rawLine) {
     return `\0TK${idx}\0`;
   });
 
-  let html = formatInlineEscaped(esc(work));
-  html = html.replace(/\0TK(\d+)\0/g, (_, i) => tokens[Number(i)] ?? '');
-  return html;
+  const html = formatInlineEscaped(esc(work));
+  return restoreTokens(html);
 }
 
 function renderMarkdownProse(blockText) {
@@ -386,6 +413,36 @@ export function createArtifactModal({ $, fmtDate, ago }) {
   };
 }
 
+export function filterDisplayHistory(rawHistory) {
+  return Array.isArray(rawHistory)
+    ? rawHistory.filter((h) => !(h?.type === 'permission' && h?.status === 'pending'))
+    : [];
+}
+
+export function appendUniqueEntry(list, entry) {
+  if (!Array.isArray(list) || !entry || typeof entry !== 'object') return false;
+  if (entry.id && list.some((m) => m?.id === entry.id)) return false;
+  list.push(entry);
+  return true;
+}
+
+export async function handleStreamErrorEvent(ev, { onServerError, onDisconnect } = {}) {
+  if (typeof ev?.data === 'string' && ev.data.trim() !== '') {
+    let data = null;
+    try {
+      data = JSON.parse(ev.data);
+    } catch {}
+    if (typeof onServerError === 'function') {
+      onServerError(data, ev.data);
+    }
+    return 'server_error';
+  }
+  if (typeof onDisconnect === 'function') {
+    await onDisconnect(ev);
+  }
+  return 'disconnect';
+}
+
 export function createChatDrawer({ $, cfg, ketuaName, ago, clip: clipFn }) {
   const drawer = $('chatDrawer');
   const toggleBtn = $('toggleChat');
@@ -670,9 +727,7 @@ export function createChatDrawer({ $, cfg, ketuaName, ago, clip: clipFn }) {
       const data = parseJsonEvent(ev);
       if (!data) return;
       if (data.status) status = { ...status, ...data.status };
-      messages = Array.isArray(data.history)
-        ? data.history.filter((h) => !(h.type === 'permission' && h.status === 'pending'))
-        : [];
+      messages = filterDisplayHistory(data.history);
       pendingPerms.clear();
       for (const p of data.pendingPermissions || []) {
         if (p?.requestId) pendingPerms.set(String(p.requestId), p);
@@ -696,7 +751,8 @@ export function createChatDrawer({ $, cfg, ketuaName, ago, clip: clipFn }) {
     stream.addEventListener('session', (ev) => {
       const data = parseJsonEvent(ev);
       if (!data) return;
-      messages.push({ id: `s-${++seq}`, type: 'session', ...data });
+      const entryId = data.id || `s-${++seq}`;
+      appendUniqueEntry(messages, { ...data, id: entryId, type: 'session' });
       if (data.sessionId) status.sessionId = data.sessionId;
       if (data.mode) status.mode = data.mode;
       if ('model' in data) status.model = data.model;
@@ -708,9 +764,9 @@ export function createChatDrawer({ $, cfg, ketuaName, ago, clip: clipFn }) {
     stream.addEventListener('message', (ev) => {
       const data = parseJsonEvent(ev);
       if (!data) return;
-      if (data.id && messages.some((m) => m.id === data.id)) return;
-      messages.push(data);
-      renderMessages();
+      if (appendUniqueEntry(messages, data)) {
+        renderMessages();
+      }
     });
 
     const onUpdate = (ev) => {
@@ -814,42 +870,42 @@ export function createChatDrawer({ $, cfg, ketuaName, ago, clip: clipFn }) {
       renderStatus();
     });
 
-    stream.addEventListener('error', (ev) => {
-      if (typeof ev.data === 'string' && ev.data) {
-        const data = parseJsonEvent(ev);
-        if (data?.error) setNotice(data.error);
-      }
-    });
-
-    stream.onerror = async () => {
-      if (es !== stream) return;
-      closeStream();
-      if (!streamOpened) {
-        try {
-          const probe = await fetch('/kerja/api/chat/auth', {
-            method: 'POST',
-            credentials: 'same-origin',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({}),
-          });
-          if (probe.status === 401) {
-            authorized = false;
-            needsAuth = true;
-            authBox.hidden = false;
-            authMsg.textContent = 'Sesi auth chat berakhir. Masukkan chat-token.';
-            renderStatus();
-            return;
+    stream.addEventListener('error', (ev) =>
+      handleStreamErrorEvent(ev, {
+        onServerError: (data) => {
+          if (data?.error) setNotice(data.error);
+        },
+        onDisconnect: async () => {
+          if (es !== stream) return;
+          closeStream();
+          if (!streamOpened) {
+            try {
+              const probe = await fetch('/kerja/api/chat/auth', {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({}),
+              });
+              if (probe.status === 401) {
+                authorized = false;
+                needsAuth = true;
+                authBox.hidden = false;
+                authMsg.textContent = 'Sesi auth chat berakhir. Masukkan chat-token.';
+                renderStatus();
+                return;
+              }
+              if (probe.status === 503) {
+                enabled = false;
+                renderStatus();
+                return;
+              }
+            } catch {}
           }
-          if (probe.status === 503) {
-            enabled = false;
-            renderStatus();
-            return;
-          }
-        } catch {}
-      }
-      setNotice('Koneksi stream chat terputus, mencoba menghubungkan ulang…', 'info');
-      scheduleReconnect();
-    };
+          setNotice('Koneksi stream chat terputus, mencoba menghubungkan ulang…', 'info');
+          scheduleReconnect();
+        },
+      })
+    );
   };
 
   const apiPost = async (endpoint, payload = {}) => {
@@ -958,7 +1014,7 @@ export function createChatDrawer({ $, cfg, ketuaName, ago, clip: clipFn }) {
         : { sessionId: val, mode: modeSelect.value, model: currentModelValue() };
       const data = await apiPost('/kerja/api/chat/session', body);
       if (data.status) status = { ...status, ...data.status };
-      if (Array.isArray(data.history)) messages = data.history;
+      if (Array.isArray(data.history)) messages = filterDisplayHistory(data.history);
       renderSessionOptions();
       renderMessages();
       renderStatus();

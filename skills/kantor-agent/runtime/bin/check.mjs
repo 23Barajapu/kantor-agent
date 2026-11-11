@@ -41,7 +41,7 @@ function rawHostProbe(baseUrl, reqPath, customHost) {
     const transport = u.protocol === 'https:' ? https : http;
     const req = transport.request(
       {
-        hostname: u.hostname,
+        hostname: u.hostname.replace(/^\[|\]$/g, ''),
         port: u.port || (u.protocol === 'https:' ? 443 : 80),
         method: 'GET',
         path: reqPath,

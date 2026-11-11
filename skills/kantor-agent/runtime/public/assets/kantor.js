@@ -10,6 +10,7 @@ import {
   esc,
   clip,
   formatRoleModel,
+  normalizeColors,
   collectArtifacts,
   createArtifactModal,
   createChatDrawer,
@@ -30,11 +31,7 @@ const TEAM_NAMES = Array.isArray(CFG.team) && CFG.team.length === 4 ? CFG.team :
 const DIVISIONS = Array.isArray(CFG.divisions) && CFG.divisions.length === 4 ? CFG.divisions : [];
 const KETUA_NAME = typeof CFG.ketua === 'string' && CFG.ketua ? CFG.ketua : 'Joko';
 const KETUA_ROLE = typeof CFG.ketua_role === 'string' && CFG.ketua_role ? CFG.ketua_role : 'Lead Architect';
-const COLORS = CFG.colors || {
-  ketua: '#6a55c9',
-  team: ['#3f6fd1', '#2f9a6d', '#d9772f', '#c2417a'],
-  freelancers: ['#0f8fa3'],
-};
+const COLORS = normalizeColors(CFG.colors);
 const NAMES_SIG = [KETUA_NAME, ...TEAM_NAMES].join('|');
 const SPARE = Number.isInteger(CFG.spare_desks) ? Math.max(0, Math.min(4, CFG.spare_desks)) : 4;
 

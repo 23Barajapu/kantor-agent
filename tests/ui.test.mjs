@@ -8,13 +8,16 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 
+import { EventEmitter } from 'node:events';
 import { createKantorServer } from '../skills/kantor-agent/runtime/bin/serve.mjs';
+import { AcpBridge } from '../skills/kantor-agent/runtime/lib/acp.mjs';
 import { loadConfig } from '../skills/kantor-agent/runtime/lib/config.mjs';
 import { SECURITY_HEADERS } from '../skills/kantor-agent/runtime/lib/http.mjs';
 
 const WORKTREE_ROOT = path.resolve(import.meta.dirname, '..');
 const RUNTIME_DIR = path.join(WORKTREE_ROOT, 'skills', 'kantor-agent', 'runtime');
 const CHECK_SCRIPT = path.join(RUNTIME_DIR, 'bin', 'check.mjs');
+const FAKE_AGY = path.join(WORKTREE_ROOT, 'tests', 'fixtures', 'fake-agy.mjs');
 
 const SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS conversation_summaries (
@@ -365,9 +368,114 @@ describe('Task 8 UI, CSP nonce, XSS escaping & smoke check', () => {
     assert.equal(artifacts.length, 2);
     assert.equal(artifacts[0].name, 'report.pdf');
     assert.equal(artifacts[1].name, 'plan.md');
+
+    // Review fix tests: link containing inline code / bold + normalizeColors + stream error + session dedup
+    const codeLinkHtml = mod.renderSafeMarkdown('Lihat [`kode`](https://example.com) dan [**tebal** `<script>`](https://example.com/a).');
+    assert.equal(codeLinkHtml.includes('\0'), false, 'placeholder token tidak boleh bocor');
+    assert.equal(codeLinkHtml.includes('TK'), false, 'placeholder TK tidak boleh bocor');
+    assert.equal(codeLinkHtml.includes('<a href="https://example.com/" target="_blank" rel="noopener noreferrer"><code>kode</code></a>'), true);
+    assert.equal(codeLinkHtml.includes('<strong>tebal</strong> <code>&lt;script&gt;</code>'), true);
+
+    assert.equal(typeof mod.normalizeColors, 'function');
+    assert.deepEqual(mod.normalizeColors(undefined), {
+      ketua: '#6a55c9',
+      team: ['#3f6fd1', '#2f9a6d', '#d9772f', '#c2417a'],
+      freelancers: ['#0f8fa3', '#9a7418', '#4f7d3a', '#8a4fa8', '#3d7f9e', '#b8452f'],
+    });
+    assert.deepEqual(mod.normalizeColors({ ketua: '#123456' }), {
+      ketua: '#123456',
+      team: ['#3f6fd1', '#2f9a6d', '#d9772f', '#c2417a'],
+      freelancers: ['#0f8fa3', '#9a7418', '#4f7d3a', '#8a4fa8', '#3d7f9e', '#b8452f'],
+    });
+    assert.deepEqual(mod.normalizeColors({ team: ['#111111', ''], freelancers: ['#222222'] }), {
+      ketua: '#6a55c9',
+      team: ['#111111', '#2f9a6d', '#d9772f', '#c2417a'],
+      freelancers: ['#222222'],
+    });
+
+    assert.equal(typeof mod.handleStreamErrorEvent, 'function');
+    let serverErrors = [];
+    let disconnects = 0;
+    const rServer = await mod.handleStreamErrorEvent(
+      { data: JSON.stringify({ error: 'Baris output ACP melebihi batas 4 MB' }) },
+      {
+        onServerError: (d) => serverErrors.push(d?.error),
+        onDisconnect: () => { disconnects += 1; },
+      }
+    );
+    assert.equal(rServer, 'server_error');
+    assert.deepEqual(serverErrors, ['Baris output ACP melebihi batas 4 MB']);
+    assert.equal(disconnects, 0);
+
+    const rDrop = await mod.handleStreamErrorEvent(
+      { type: 'error' },
+      {
+        onServerError: (d) => serverErrors.push(d?.error),
+        onDisconnect: () => { disconnects += 1; },
+      }
+    );
+    assert.equal(rDrop, 'disconnect');
+    assert.equal(disconnects, 1);
+
+    assert.equal(typeof mod.filterDisplayHistory, 'function');
+    assert.equal(typeof mod.appendUniqueEntry, 'function');
+    const filtered = mod.filterDisplayHistory([
+      { id: 'h-1', type: 'session', action: 'new' },
+      { id: 'h-2', type: 'permission', status: 'pending' },
+      { id: 'h-3', type: 'permission', status: 'resolved' },
+    ]);
+    assert.deepEqual(filtered.map((x) => x.id), ['h-1', 'h-3']);
+    assert.equal(mod.appendUniqueEntry(filtered, { id: 'h-1', type: 'session' }), false);
+    assert.equal(mod.appendUniqueEntry(filtered, { id: 'h-4', type: 'session' }), true);
+    assert.equal(filtered.length, 3);
   });
 
-  it('bin/check.mjs passes end-to-end against live ephemeral createKantorServer', async () => {
+  it('AcpBridge broadcasts matching history id on session SSE event (new & load) and check.mjs handles IPv6', async () => {
+    const env = makeTempEnv();
+    const bridge = new AcpBridge({
+      projectDir: env.projectDir,
+      agyBin: FAKE_AGY,
+      isCliSession: () => true,
+    });
+    const emitter = new EventEmitter();
+    const chunks = [];
+    const mockRes = {
+      headersSent: false,
+      writableEnded: false,
+      destroyed: false,
+      writeHead() { this.headersSent = true; },
+      write(c) { chunks.push(String(c)); emitter.emit('chunk'); return true; },
+      end() { this.writableEnded = true; emitter.emit('close'); },
+      on(ev, fn) { emitter.on(ev, fn); return this; },
+    };
+
+    try {
+      bridge.subscribeSse(mockRes);
+      await bridge.createSession();
+      await bridge.loadSession('cli-idle-1');
+
+      const raw = chunks.join('');
+      const sessionMatches = Array.from(raw.matchAll(/event:\s*session\ndata:\s*(\{[^\n]+\})/g)).map((m) =>
+        JSON.parse(m[1])
+      );
+      assert.equal(sessionMatches.length, 2, 'wajib ada 2 event session (new & load)');
+      const histSessions = bridge.getHistory().filter((h) => h.type === 'session');
+      assert.equal(histSessions.length, 2);
+      assert.equal(sessionMatches[0].id, histSessions[0].id);
+      assert.equal(sessionMatches[1].id, histSessions[1].id);
+
+      const kantorSrc = fs.readFileSync(path.join(RUNTIME_DIR, 'public', 'assets', 'kantor.js'), 'utf8');
+      assert.equal(kantorSrc.includes('normalizeColors(CFG.colors)'), true);
+
+      const checkSource = fs.readFileSync(CHECK_SCRIPT, 'utf8');
+      assert.equal(checkSource.includes(".replace(/^\\[|\\]$/g, '')"), true, 'check.mjs wajib melepas kurung siku IPv6');
+    } finally {
+      await bridge.shutdown();
+      cleanDir(env.base);
+    }
+  });
+
+  it('bin/check.mjs passes end-to-end against live ephemeral createKantorServer (IPv4 & IPv6)', async () => {
     const env = makeTempEnv();
     const convId = '33333333-3333-4333-8333-333333333333';
     seedConversation(env.antigravityHome, env.projectDir, convId);
@@ -382,12 +490,29 @@ describe('Task 8 UI, CSP nonce, XSS escaping & smoke check', () => {
       cfg,
     });
 
+    let ipv6Server = null;
     try {
       const token = server.authManager.getToken();
       const res = await runCheckCli([`http://127.0.0.1:${port}`, '--token', token]);
       assert.equal(res.code, 0, `check.mjs gagal:\nSTDOUT:\n${res.stdout}\nSTDERR:\n${res.stderr}`);
       assert.ok(res.stdout.includes('OK ('), `Expected OK summary, got:\n${res.stdout}`);
+
+      ipv6Server = createKantorServer({
+        projectDir: env.projectDir,
+        runtimeDir: RUNTIME_DIR,
+        storageDir: env.storageDir,
+        cfg,
+      });
+      const ipv6Port = await new Promise((resolve) => {
+        ipv6Server.once('error', () => resolve(null));
+        ipv6Server.listen(0, '::1', () => resolve(ipv6Server.address().port));
+      });
+      if (ipv6Port !== null) {
+        const res6 = await runCheckCli([`http://[::1]:${ipv6Port}`, '--token', token]);
+        assert.equal(res6.code, 0, `check.mjs IPv6 gagal:\nSTDOUT:\n${res6.stdout}\nSTDERR:\n${res6.stderr}`);
+      }
     } finally {
+      await stopServer(ipv6Server);
       await stopServer(server);
       if (prevAg === undefined) delete process.env.ANTIGRAVITY_HOME;
       else process.env.ANTIGRAVITY_HOME = prevAg;
