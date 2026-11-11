@@ -16,6 +16,8 @@ const AGENTS_RESOURCES_DIR = path.join(WORKTREE_ROOT, 'skills', 'kantor-agent', 
 const RULES_AGENTS_PATH = path.join(WORKTREE_ROOT, 'rules', 'AGENTS.md');
 const SKILL_MD_PATH = path.join(WORKTREE_ROOT, 'skills', 'kantor-agent', 'SKILL.md');
 const README_PATH = path.join(WORKTREE_ROOT, 'README.md');
+const README_ID_PATH = path.join(WORKTREE_ROOT, 'README.id.md');
+const PREVIEW_PNG_PATH = path.join(WORKTREE_ROOT, 'assets', 'preview.png');
 const LICENSE_PATH = path.join(WORKTREE_ROOT, 'LICENSE');
 const THIRD_PARTY_PATH = path.join(WORKTREE_ROOT, 'THIRD_PARTY_NOTICES.md');
 const PLUGIN_JSON_PATH = path.join(WORKTREE_ROOT, 'plugin.json');
@@ -267,7 +269,7 @@ describe('Task 9: rules/AGENTS.md, IT specialist templates, setupTeam, and CLI l
     }
   });
 
-  it('SKILL.md and README.md exist with required Antigravity plugin & setup-team documentation', () => {
+  it('SKILL.md, README.md, README.id.md, and assets/preview.png exist with required documentation and clean formatting', () => {
     assert.ok(fs.existsSync(SKILL_MD_PATH), 'skills/kantor-agent/SKILL.md must exist');
     const skillRaw = fs.readFileSync(SKILL_MD_PATH, 'utf8');
     const skillParsed = parseYamlFrontmatter(skillRaw);
@@ -277,6 +279,7 @@ describe('Task 9: rules/AGENTS.md, IT specialist templates, setupTeam, and CLI l
     assert.ok(skillRaw.includes('kantor.mjs'));
     assert.ok(skillRaw.includes('setup-team'));
     assert.ok(skillRaw.includes('.agents/kantor-agent.json'));
+    assert.ok(skillRaw.includes('agy plugin install ./kantor-agent'), 'SKILL.md should document local plugin install');
 
     assert.ok(fs.existsSync(README_PATH), 'README.md must exist');
     const readmeRaw = fs.readFileSync(README_PATH, 'utf8');
@@ -284,6 +287,25 @@ describe('Task 9: rules/AGENTS.md, IT specialist templates, setupTeam, and CLI l
     assert.ok(readmeRaw.includes('humaedihume/kantor-agent'));
     assert.ok(readmeRaw.includes('MIT'));
     assert.ok(readmeRaw.includes('setup-team'));
+    assert.ok(readmeRaw.includes('assets/preview.png'), 'README.md must embed assets/preview.png');
+    assert.ok(readmeRaw.includes('README.id.md'), 'README.md must link to README.id.md');
+    assert.equal(readmeRaw.includes('—'), false, 'README.md must contain zero em-dashes');
+
+    assert.ok(fs.existsSync(README_ID_PATH), 'README.id.md must exist');
+    const readmeIdRaw = fs.readFileSync(README_ID_PATH, 'utf8');
+    assert.ok(readmeIdRaw.includes('Kantor Agent'));
+    assert.ok(readmeIdRaw.includes('humaedihume/kantor-agent'));
+    assert.ok(readmeIdRaw.includes('MIT'));
+    assert.ok(readmeIdRaw.includes('setup-team'));
+    assert.ok(readmeIdRaw.includes('assets/preview.png'), 'README.id.md must embed assets/preview.png');
+    assert.ok(readmeIdRaw.includes('README.md'), 'README.id.md must link to README.md');
+    assert.equal(readmeIdRaw.includes('—'), false, 'README.id.md must contain zero em-dashes');
+
+    assert.ok(fs.existsSync(PREVIEW_PNG_PATH), 'assets/preview.png must exist');
+    const previewBuf = fs.readFileSync(PREVIEW_PNG_PATH);
+    assert.ok(previewBuf.length > 1000, 'assets/preview.png must not be empty');
+    const pngMagic = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+    assert.equal(previewBuf.subarray(0, 4).equals(pngMagic), true, 'assets/preview.png must have valid PNG magic bytes');
   });
 
   it('setupTeam() copies 4 templates idempotently to ANTIGRAVITY_CONFIG_DIR and respects force flag', async () => {

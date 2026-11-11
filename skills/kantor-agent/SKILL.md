@@ -10,8 +10,18 @@ description: >-
 
 Buka kantor 3D Three.js real-time untuk memantau **Ketua (Joko)**, **4 divisi Tim IT spesialis** (**Budi**, **Sari**, **Agus**, **Rina**), **Freelancer**, papan **Tugas Ketua** (`task.md`), pratinjau **Artifact**, serta **Laci Chat Ketua (`C`)** berbasis **`agy acp --stdio`** langsung dari browser. Berjalan murni di **Node.js `>= 22.5`** tanpa WSL, `bash`, atau dependensi `npm` eksternal.
 
-## 1. Jalankan Launcher CLI (`kantor.mjs`)
+## 1. Pemasangan & Launcher CLI (`kantor.mjs`)
 
+### Pemasangan Plugin Antigravity
+Plugin dapat dipasang ke Antigravity dari repositori lokal:
+
+```powershell
+# Klona dan pasang plugin
+git clone https://github.com/23Barajapu/kantor-agent.git
+agy plugin install ./kantor-agent
+```
+
+### Menjalankan CLI Langsung
 Dari direktori skill ini (atau resolusi path `SKILL_DIR` plugin):
 
 ```powershell
@@ -84,4 +94,4 @@ Opsional, letakkan di root proyek untuk menimpa bawaan `defaults.json`:
 - Default server hanya mengikat **`127.0.0.1`**; akses loopback lokal otomatis terotentikasi.
 - Untuk akses **LAN (`--bind 0.0.0.0`)** atau **tunnel publik (`tunnel`)**, autentikasi chat ACP mewajibkan **`chat-token`** (`timingSafeEqual` + cookie `HttpOnly; SameSite=Strict` + validasi `Host` & `Origin`). **Jangan bagikan atau commit `chat-token`**.
 - **Aturan kerahasiaan token bagi agen:** Saat menjalankan `start` atau `tunnel`, **jangan menjalankan `kantor.mjs token` dan jangan membaca/menyalin nilai `chat-token` ke percakapan** kecuali diminta secara eksplisit oleh pengguna. Arahkan pengguna mengambil token langsung lewat perintah `node "${SKILL_DIR}/runtime/bin/kantor.mjs" token` atau membaca file `chat-token` di direktori storage yang tercetak.
-- Di browser, tekan **`C`** untuk membuka laci **Chat Ketua** (pilih sesi CLI/ACP, mode `accept-edits`/`plan`/`auto`, model, kartu izin interaktif 120 detik), tekan **`H`** untuk tampilan kantor penuh, dan klik tab **Artifact** untuk pratinjau teredaksi.
+- Di browser, tekan **`C`** untuk membuka laci **Chat Ketua** (pilih sesi CLI/ACP, mode `accept-edits`/`plan`/`auto`, pemilih model dinamis terintegrasi `agy models` dengan input model kustom cadangan, kartu izin interaktif 120 detik), tekan **`H`** untuk tampilan kantor penuh, dan klik tab **Artifact** untuk pratinjau teredaksi.
