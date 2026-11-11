@@ -8,7 +8,7 @@ import { loadConfig } from '../lib/config.mjs';
 import { buildState } from '../lib/office.mjs';
 import { scanConversations } from '../lib/antigravity.mjs';
 import { readSafeArtifact } from '../lib/artifacts.mjs';
-import { isDir, isFile, isoMs } from '../lib/util.mjs';
+import { isDir, isFile, isInsideDir, isPlainObj, isoMs } from '../lib/util.mjs';
 import {
   SECURITY_HEADERS,
   hostAllowed,
@@ -57,14 +57,6 @@ const FALLBACK_PAGE_HTML = `<!doctype html>
 </html>
 `;
 
-function isInsideDir(childPath, parentPath) {
-  const isWin = process.platform === 'win32';
-  const prefix = parentPath.endsWith(path.sep) ? parentPath : parentPath + path.sep;
-  return isWin
-    ? childPath.toLowerCase().startsWith(prefix.toLowerCase())
-    : childPath.startsWith(prefix);
-}
-
 function sendJson(res, status, data, extraHeaders = {}) {
   if (res.headersSent) {
     res.end();
@@ -73,11 +65,23 @@ function sendJson(res, status, data, extraHeaders = {}) {
   const body = Buffer.from(JSON.stringify(data), 'utf8');
   res.writeHead(status, {
     ...SECURITY_HEADERS,
+    'Cache-Control': 'no-store',
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': String(body.length),
     ...extraHeaders,
   });
   res.end(body);
+}
+
+async function readChatObjectBody(req) {
+  const body = await readJsonBody(req, 65536);
+  if (!isPlainObj(body)) {
+    throw Object.assign(new Error('Body JSON harus berupa objek'), {
+      status: 400,
+      code: 'INVALID_JSON_OBJECT',
+    });
+  }
+  return body;
 }
 
 function sendBuffer(res, status, contentType, buf, extraHeaders = {}) {
@@ -252,11 +256,21 @@ async function handleChat(req, res, pathname, method, { cfg, authManager, acpBri
     if (method !== 'POST') {
       return sendJson(res, 405, { ok: false, error: 'Metode tidak diizinkan' }, { Allow: 'POST' });
     }
-    if (!checkSameOrigin(req)) {
+    if (!checkSameOrigin(req, { requireOrigin: false })) {
       return sendJson(res, 403, { ok: false, error: 'Permintaan lintas origin ditolak' });
     }
 
-    const body = await readJsonBody(req, 65536);
+    const body = await readChatObjectBody(req);
+    const hdrToken = extractBearerOrHeaderToken(req);
+    const bodyToken = typeof body.token === 'string' ? body.token : null;
+    const hasValidToken =
+      (hdrToken !== null && authManager.verifyToken(hdrToken)) ||
+      (bodyToken !== null && authManager.verifyToken(bodyToken));
+
+    if (!hasValidToken && !checkSameOrigin(req, { requireOrigin: true })) {
+      return sendJson(res, 403, { ok: false, error: 'Header Origin/Referer wajib disertakan' });
+    }
+
     const proto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
     const isHttps = req.socket?.encrypted === true || proto === 'https';
 
@@ -267,14 +281,12 @@ async function handleChat(req, res, pathname, method, { cfg, authManager, acpBri
         { ok: true, mode: 'loopback' },
         {
           'Set-Cookie': authManager.setSessionCookieHeader(isHttps),
-          'Cache-Control': 'no-store',
         }
       );
     }
 
-    const cand = typeof body?.token === 'string' ? body.token : extractBearerOrHeaderToken(req);
-    if (!authManager.verifyToken(cand)) {
-      return sendJson(res, 401, { ok: false, error: 'Token chat tidak valid' }, { 'Cache-Control': 'no-store' });
+    if (!hasValidToken) {
+      return sendJson(res, 401, { ok: false, error: 'Token chat tidak valid' });
     }
 
     return sendJson(
@@ -283,7 +295,6 @@ async function handleChat(req, res, pathname, method, { cfg, authManager, acpBri
       { ok: true, mode: 'token' },
       {
         'Set-Cookie': authManager.setSessionCookieHeader(isHttps),
-        'Cache-Control': 'no-store',
       }
     );
   }
@@ -316,11 +327,14 @@ async function handleChat(req, res, pathname, method, { cfg, authManager, acpBri
   if (!authManager.isAuthorized(req)) {
     return sendJson(res, 401, { ok: false, error: 'Autentikasi chat diperlukan' });
   }
-  if (!checkSameOrigin(req)) {
+
+  const hdrToken = extractBearerOrHeaderToken(req);
+  const hasValidHeaderToken = hdrToken !== null && authManager.verifyToken(hdrToken);
+  if (!checkSameOrigin(req, { requireOrigin: !hasValidHeaderToken })) {
     return sendJson(res, 403, { ok: false, error: 'Permintaan lintas origin ditolak' });
   }
 
-  const body = await readJsonBody(req, 65536);
+  const body = await readChatObjectBody(req);
 
   if (!acpBridge || typeof acpBridge[actionName] !== 'function') {
     return sendJson(res, 503, { ok: false, error: 'Jembatan ACP belum tersedia' });
@@ -329,21 +343,23 @@ async function handleChat(req, res, pathname, method, { cfg, authManager, acpBri
   try {
     const result = await acpBridge[actionName](body);
     if (result && typeof result === 'object' && Number.isInteger(result.status) && 'body' in result) {
-      return sendJson(res, result.status, result.body, { 'Cache-Control': 'no-store' });
+      return sendJson(res, result.status, result.body);
     }
-    return sendJson(res, 200, result && typeof result === 'object' ? result : { ok: true }, {
-      'Cache-Control': 'no-store',
-    });
+    return sendJson(res, 200, result && typeof result === 'object' ? result : { ok: true });
   } catch (err) {
-    const status = Number.isInteger(err?.status) && err.status >= 400 && err.status <= 599 ? err.status : 500;
+    const isClientError = Number.isInteger(err?.status) && err.status >= 400 && err.status < 500;
+    const status = isClientError ? err.status : 500;
     const payload =
-      err?.body && typeof err.body === 'object'
+      isClientError && err?.body && typeof err.body === 'object'
         ? err.body
         : {
             ok: false,
-            error: typeof err?.message === 'string' && err.message ? err.message : 'Kesalahan jembatan ACP',
+            error:
+              isClientError && typeof err?.message === 'string' && err.message
+                ? err.message
+                : 'Kesalahan jembatan ACP',
           };
-    return sendJson(res, status, payload, { 'Cache-Control': 'no-store' });
+    return sendJson(res, status, payload);
   }
 }
 
@@ -441,14 +457,14 @@ export function createKantorServer(opts = {}) {
         res.end();
         return;
       }
-      const status = Number.isInteger(err?.status) && err.status >= 400 && err.status <= 599 ? err.status : 500;
-      const extraHeaders = status === 413 ? { Connection: 'close', 'Cache-Control': 'no-store' } : { 'Cache-Control': 'no-store' };
-      return sendJson(
-        res,
-        status,
-        { ok: false, error: typeof err?.message === 'string' && err.message ? err.message : 'Kesalahan internal server' },
-        extraHeaders
-      );
+      const isClientError = Number.isInteger(err?.status) && err.status >= 400 && err.status < 500;
+      const status = isClientError ? err.status : 500;
+      const errorMsg =
+        isClientError && typeof err?.message === 'string' && err.message
+          ? err.message
+          : 'Kesalahan internal server';
+      const extraHeaders = status === 413 ? { Connection: 'close' } : {};
+      return sendJson(res, status, { ok: false, error: errorMsg }, extraHeaders);
     }
   });
 
@@ -457,8 +473,14 @@ export function createKantorServer(opts = {}) {
   return server;
 }
 
-function parseCliArgs(argv) {
+export function parseCliArgs(argv) {
   const out = {};
+  const parseValidPort = (raw) => {
+    const s = String(raw ?? '').trim();
+    if (s === '' || !/^\d+$/.test(s)) return null;
+    const p = Number(s);
+    return Number.isInteger(p) && p >= 0 && p <= 65535 ? p : null;
+  };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--sandbox') {
@@ -481,11 +503,11 @@ function parseCliArgs(argv) {
     } else if (arg.startsWith('--bind=')) {
       out.bind = arg.slice('--bind='.length);
     } else if (arg === '--port' && i + 1 < argv.length) {
-      const p = Number(argv[++i]);
-      if (Number.isInteger(p) && p >= 0 && p <= 65535) out.port = p;
+      const p = parseValidPort(argv[++i]);
+      if (p !== null) out.port = p;
     } else if (arg.startsWith('--port=')) {
-      const p = Number(arg.slice('--port='.length));
-      if (Number.isInteger(p) && p >= 0 && p <= 65535) out.port = p;
+      const p = parseValidPort(arg.slice('--port='.length));
+      if (p !== null) out.port = p;
     }
   }
   return out;

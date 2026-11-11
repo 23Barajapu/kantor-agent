@@ -4,6 +4,7 @@ import path from 'node:path';
 import {
   isDir,
   isFile,
+  isInsideDir,
   readText,
   safeLine,
   redact,
@@ -33,14 +34,6 @@ export const ALLOWED_EXT_MAP = {
   '.webp': { kind: 'image', category: 'image', mime: 'image/webp' },
   '.pdf': { kind: 'pdf', category: 'pdf', mime: 'application/pdf' },
 };
-
-function isInsideDir(childPath, parentPath) {
-  const isWin = process.platform === 'win32';
-  const prefix = parentPath.endsWith(path.sep) ? parentPath : parentPath + path.sep;
-  return isWin
-    ? childPath.toLowerCase().startsWith(prefix.toLowerCase())
-    : childPath.startsWith(prefix);
-}
 
 /**
  * Memeriksa apakah segmen-segmen relative path aman:

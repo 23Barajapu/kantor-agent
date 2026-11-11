@@ -142,9 +142,9 @@ function isLoopbackIp(ip) {
 
 function hasHeaderValue(val) {
   if (Array.isArray(val)) {
-    return val.some((item) => String(item ?? '').trim() !== '');
+    return val.some((item) => item !== undefined && item !== null);
   }
-  return val !== undefined && val !== null && String(val).trim() !== '';
+  return val !== undefined && val !== null;
 }
 
 /**
@@ -174,25 +174,40 @@ export function isPureLoopback(req) {
 
 /**
  * Memvalidasi Same-Origin (anti-CSRF) berdasarkan `Sec-Fetch-Site`, `Origin`, dan `Referer`.
+ * Bila `requireOrigin: true`, wajib ada minimal satu sinyal origin sah yang cocok dengan `Host`.
  */
-export function checkSameOrigin(req) {
+export function checkSameOrigin(req, opts = {}) {
+  const requireOrigin = Boolean(opts?.requireOrigin);
   const headers = req?.headers ?? {};
+  const method = String(req?.method || 'POST').toUpperCase();
+  const isReadMethod = method === 'GET' || method === 'HEAD';
+
+  let secFetchSameOrigin = false;
   const secFetchSite = headers['sec-fetch-site'];
   if (secFetchSite !== undefined) {
     const list = Array.isArray(secFetchSite) ? secFetchSite : [secFetchSite];
-    if (list.some((v) => String(v ?? '').trim().toLowerCase() === 'cross-site')) {
-      return false;
+    if (list.length === 0) return false;
+    const allowedSecFetch = isReadMethod ? new Set(['same-origin', 'none']) : new Set(['same-origin']);
+    for (const item of list) {
+      const val = String(item ?? '').trim().toLowerCase();
+      if (!allowedSecFetch.has(val)) {
+        return false;
+      }
     }
+    secFetchSameOrigin = list.every((item) => String(item ?? '').trim().toLowerCase() === 'same-origin');
   }
 
   const reqHost = typeof headers.host === 'string' ? headers.host.trim() : '';
+  let originMatched = false;
+  let refererMatched = false;
 
   if (headers.origin !== undefined) {
     if (typeof headers.origin !== 'string' || !reqHost) return false;
     try {
       const u = new URL(headers.origin);
       if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
-      return u.host.toLowerCase() === reqHost.toLowerCase();
+      if (u.host.toLowerCase() !== reqHost.toLowerCase()) return false;
+      originMatched = true;
     } catch {
       return false;
     }
@@ -203,10 +218,15 @@ export function checkSameOrigin(req) {
     try {
       const u = new URL(headers.referer);
       if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
-      return u.host.toLowerCase() === reqHost.toLowerCase();
+      if (u.host.toLowerCase() !== reqHost.toLowerCase()) return false;
+      refererMatched = true;
     } catch {
       return false;
     }
+  }
+
+  if (requireOrigin) {
+    return originMatched || refererMatched || (secFetchSameOrigin && reqHost !== '');
   }
 
   return true;
@@ -236,7 +256,7 @@ export function readJsonBody(req, maxBytes = 65536) {
       req.removeListener('data', onData);
       req.removeListener('end', onEnd);
       req.removeListener('error', onError);
-      req.removeListener('aborted', onAborted);
+      req.removeListener('close', onClose);
     };
 
     const fail = (err) => {
@@ -280,14 +300,16 @@ export function readJsonBody(req, maxBytes = 65536) {
       fail(Object.assign(err instanceof Error ? err : new Error('Gagal membaca request'), { status: 400, code: 'READ_ERROR' }));
     };
 
-    const onAborted = () => {
-      fail(Object.assign(new Error('Request dibatalkan klien'), { status: 400, code: 'REQUEST_ABORTED' }));
+    const onClose = () => {
+      if (!settled && !req.complete) {
+        fail(Object.assign(new Error('Request ditutup sebelum selesai'), { status: 400, code: 'REQUEST_ABORTED' }));
+      }
     };
 
     req.on('data', onData);
     req.on('end', onEnd);
     req.on('error', onError);
-    req.on('aborted', onAborted);
+    req.on('close', onClose);
   });
 }
 
@@ -341,8 +363,11 @@ export function createAuthManager(stateDir) {
 
   if (!token) {
     token = crypto.randomBytes(32).toString('hex');
-    fs.mkdirSync(stateDir, { recursive: true });
+    fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
     fs.writeFileSync(tokenPath, token, { encoding: 'utf8', mode: 0o600 });
+    try {
+      fs.chmodSync(tokenPath, 0o600);
+    } catch {}
   }
 
   const expectedCookie = crypto

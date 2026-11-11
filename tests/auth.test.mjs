@@ -16,8 +16,9 @@ import {
   readJsonBody,
   createAuthManager,
 } from '../skills/kantor-agent/runtime/lib/http.mjs';
-import { createKantorServer } from '../skills/kantor-agent/runtime/bin/serve.mjs';
+import { createKantorServer, parseCliArgs } from '../skills/kantor-agent/runtime/bin/serve.mjs';
 import { loadConfig } from '../skills/kantor-agent/runtime/lib/config.mjs';
+import { isInsideDir } from '../skills/kantor-agent/runtime/lib/util.mjs';
 
 const RUNTIME_DIR = path.resolve(import.meta.dirname, '..', 'skills', 'kantor-agent', 'runtime');
 
@@ -156,6 +157,15 @@ function extractCookiePair(setCookieHeader) {
   return raw.split(';')[0].trim();
 }
 
+function assertApiErrorHeaders(res) {
+  assert.equal(res.headers['x-content-type-options'], 'nosniff');
+  assert.equal(res.headers['x-frame-options'], 'DENY');
+  assert.equal(res.headers['referrer-policy'], 'no-referrer');
+  assert.equal(res.headers['cross-origin-resource-policy'], 'same-origin');
+  assert.ok(res.headers['content-security-policy']?.includes("frame-ancestors 'none'"));
+  assert.equal(res.headers['cache-control'], 'no-store');
+}
+
 describe('http.mjs security primitives', () => {
   it('exports frozen SECURITY_HEADERS with required directives', () => {
     assert.equal(Object.isFrozen(SECURITY_HEADERS), true);
@@ -239,36 +249,70 @@ describe('http.mjs security primitives', () => {
         false,
         `proxy header ${proxyHeader} harus menolak pure loopback`
       );
+      assert.equal(
+        isPureLoopback(mkReq('127.0.0.1', '127.0.0.1:8788', { [proxyHeader]: '' })),
+        false,
+        `proxy header ${proxyHeader} kosong yang hadir tetap harus menolak pure loopback`
+      );
     }
   });
 
-  it('checkSameOrigin blocks cross-site Sec-Fetch-Site, mismatched Origin/Referer, and Origin: null', () => {
+  it('checkSameOrigin enforces Sec-Fetch-Site strictness, Origin/Referer match, and requireOrigin option', () => {
     assert.equal(
-      checkSameOrigin({ headers: { host: '127.0.0.1:8788' } }),
+      checkSameOrigin({ method: 'POST', headers: { host: '127.0.0.1:8788' } }),
       true
     );
     assert.equal(
-      checkSameOrigin({ headers: { host: '127.0.0.1:8788', origin: 'http://127.0.0.1:8788' } }),
+      checkSameOrigin({ method: 'POST', headers: { host: '127.0.0.1:8788' } }, { requireOrigin: true }),
+      false
+    );
+    assert.equal(
+      checkSameOrigin(
+        { method: 'POST', headers: { host: '127.0.0.1:8788', 'sec-fetch-site': 'same-origin' } },
+        { requireOrigin: true }
+      ),
       true
     );
     assert.equal(
-      checkSameOrigin({ headers: { host: '127.0.0.1:8788', referer: 'http://127.0.0.1:8788/kerja' } }),
+      checkSameOrigin({ method: 'POST', headers: { host: '127.0.0.1:8788', 'sec-fetch-site': 'same-site' } }),
+      false
+    );
+    assert.equal(
+      checkSameOrigin({ method: 'POST', headers: { host: '127.0.0.1:8788', 'sec-fetch-site': 'none' } }),
+      false
+    );
+    assert.equal(
+      checkSameOrigin({ method: 'GET', headers: { host: '127.0.0.1:8788', 'sec-fetch-site': 'none' } }),
       true
     );
     assert.equal(
-      checkSameOrigin({ headers: { host: '127.0.0.1:8788', 'sec-fetch-site': 'cross-site' } }),
+      checkSameOrigin(
+        { method: 'POST', headers: { host: '127.0.0.1:8788', origin: 'http://127.0.0.1:8788' } },
+        { requireOrigin: true }
+      ),
+      true
+    );
+    assert.equal(
+      checkSameOrigin(
+        { method: 'POST', headers: { host: '127.0.0.1:8788', referer: 'http://127.0.0.1:8788/kerja' } },
+        { requireOrigin: true }
+      ),
+      true
+    );
+    assert.equal(
+      checkSameOrigin({ method: 'POST', headers: { host: '127.0.0.1:8788', 'sec-fetch-site': 'cross-site' } }),
       false
     );
     assert.equal(
-      checkSameOrigin({ headers: { host: '127.0.0.1:8788', origin: 'https://attacker.test' } }),
+      checkSameOrigin({ method: 'POST', headers: { host: '127.0.0.1:8788', origin: 'https://attacker.test' } }),
       false
     );
     assert.equal(
-      checkSameOrigin({ headers: { host: '127.0.0.1:8788', origin: 'null' } }),
+      checkSameOrigin({ method: 'POST', headers: { host: '127.0.0.1:8788', origin: 'null' } }),
       false
     );
     assert.equal(
-      checkSameOrigin({ headers: { host: '127.0.0.1:8788', referer: 'https://attacker.test/x' } }),
+      checkSameOrigin({ method: 'POST', headers: { host: '127.0.0.1:8788', referer: 'https://attacker.test/x' } }),
       false
     );
   });
@@ -310,7 +354,7 @@ describe('http.mjs security primitives', () => {
     }
   });
 
-  it('readJsonBody parses empty body as {}, rejects invalid JSON (400) and > maxBytes (413)', async () => {
+  it('readJsonBody parses empty body as {}, rejects invalid JSON (400), > maxBytes / Content-Length / multibyte UTF-8 (413), and premature close', async () => {
     const emptyReq = Readable.from([]);
     assert.deepEqual(await readJsonBody(emptyReq), {});
 
@@ -329,10 +373,54 @@ describe('http.mjs security primitives', () => {
       (err) => err?.status === 413 && err?.code === 'PAYLOAD_TOO_LARGE'
     );
 
+    // Multibyte UTF-8 (< 65536 chars tapi > 65536 bytes)
+    const emojiText = '🚀'.repeat(20000);
+    assert.ok(emojiText.length < 65536);
+    const emojiJson = JSON.stringify({ t: emojiText });
+    assert.ok(Buffer.byteLength(emojiJson, 'utf8') > 65536);
+    await assert.rejects(
+      () => readJsonBody(Readable.from([Buffer.from(emojiJson, 'utf8')]), 65536),
+      (err) => err?.status === 413 && err?.code === 'PAYLOAD_TOO_LARGE'
+    );
+
+    // Declared Content-Length > maxBytes
+    const declaredStream = Readable.from([Buffer.from('{"a":1}')]);
+    declaredStream.headers = { 'content-length': '70000' };
+    await assert.rejects(
+      () => readJsonBody(declaredStream, 65536),
+      (err) => err?.status === 413 && err?.code === 'PAYLOAD_TOO_LARGE'
+    );
+
+    // Premature close before end
+    const incompleteStream = new Readable({ read() {} });
+    incompleteStream.complete = false;
+    const pendingClose = readJsonBody(incompleteStream, 65536);
+    incompleteStream.push('{"partial":');
+    incompleteStream.destroy();
+    await assert.rejects(
+      () => pendingClose,
+      (err) => err?.status === 400 && err?.code === 'REQUEST_ABORTED'
+    );
+
     await assert.rejects(
       () => readJsonBody(Readable.from([Buffer.from('{bad')]), 65536),
       (err) => err?.status === 400 && err?.code === 'INVALID_JSON'
     );
+  });
+
+  it('parseCliArgs ignores empty --port= and parses valid flags, and isInsideDir checks path bounds', () => {
+    const emptyPortArgs = parseCliArgs(['--port=', '--bind', '127.0.0.1']);
+    assert.equal('port' in emptyPortArgs, false);
+    assert.equal(emptyPortArgs.bind, '127.0.0.1');
+
+    const validArgs = parseCliArgs(['--port=8790', '--sandbox']);
+    assert.equal(validArgs.port, 8790);
+    assert.equal(validArgs.sandbox, true);
+
+    const root = path.resolve(os.tmpdir(), 'kantor-root');
+    assert.equal(isInsideDir(path.join(root, 'a', 'b.txt'), root), true);
+    assert.equal(isInsideDir(root, root), false);
+    assert.equal(isInsideDir(root + '-other' + path.sep + 'x.txt', root), false);
   });
 });
 
@@ -434,12 +522,23 @@ describe('serve.mjs HTTP server, security & routes', () => {
       const token = fs.readFileSync(tokenFile, 'utf8').trim();
       assert.match(token, /^[0-9a-f]{64}$/);
 
-      // 1. Socket 127.0.0.1 WITH proxy header or tunnel Host without token -> 401 (no Set-Cookie)
+      // 0. POST /kerja/api/chat/auth tanpa Origin dan tanpa token -> 403 (even on pure loopback)
+      const authNoOrigin = await rawRequest(port, {
+        method: 'POST',
+        reqPath: '/kerja/api/chat/auth',
+        headers: { Host: `127.0.0.1:${port}`, 'Content-Type': 'application/json' },
+        body: {},
+      });
+      assert.equal(authNoOrigin.status, 403);
+      assertApiErrorHeaders(authNoOrigin);
+      assert.equal(authNoOrigin.headers['set-cookie'], undefined);
+
+      // 1. Socket 127.0.0.1 WITH proxy header or tunnel Host (dan Origin sah) tanpa token -> 401 (no Set-Cookie)
       for (const badHeaders of [
-        { Host: `127.0.0.1:${port}`, 'X-Forwarded-For': '1.2.3.4' },
-        { Host: `127.0.0.1:${port}`, Forwarded: 'for=1.2.3.4' },
-        { Host: `127.0.0.1:${port}`, 'CF-Connecting-IP': '1.2.3.4' },
-        { Host: 'tunnel.trycloudflare.com' },
+        { Host: `127.0.0.1:${port}`, Origin: `http://127.0.0.1:${port}`, 'X-Forwarded-For': '1.2.3.4' },
+        { Host: `127.0.0.1:${port}`, Origin: `http://127.0.0.1:${port}`, Forwarded: 'for=1.2.3.4' },
+        { Host: `127.0.0.1:${port}`, Origin: `http://127.0.0.1:${port}`, 'CF-Connecting-IP': '1.2.3.4' },
+        { Host: 'tunnel.trycloudflare.com', Origin: 'https://tunnel.trycloudflare.com' },
       ]) {
         const res = await rawRequest(port, {
           method: 'POST',
@@ -448,10 +547,11 @@ describe('serve.mjs HTTP server, security & routes', () => {
           body: {},
         });
         assert.equal(res.status, 401);
+        assertApiErrorHeaders(res);
         assert.equal(res.headers['set-cookie'], undefined);
       }
 
-      // 2. Proxy header / tunnel Host WITH valid token -> 200 + Set-Cookie + authenticated send works
+      // 2. Proxy header / tunnel Host WITH valid token (bahkan tanpa Origin, CLI/bootstrap token flow) -> 200 + Set-Cookie + authenticated send works
       const tunnelAuth = await rawRequest(port, {
         method: 'POST',
         reqPath: '/kerja/api/chat/auth',
@@ -488,12 +588,13 @@ describe('serve.mjs HTTP server, security & routes', () => {
       assert.equal(sendAfterToken.status, 200);
       assert.deepEqual(sentPrompts[0], { text: 'Halo Ketua' });
 
-      // 3. Pure loopback (127.0.0.1 + Host: 127.0.0.1:<port>, no proxy headers) -> 200 + Set-Cookie
+      // 3. Pure loopback (127.0.0.1 + Host: 127.0.0.1:<port> + Origin matching Host, no proxy headers) -> 200 + Set-Cookie
       const loopbackAuth = await rawRequest(port, {
         method: 'POST',
         reqPath: '/kerja/api/chat/auth',
         headers: {
           Host: `127.0.0.1:${port}`,
+          Origin: `http://127.0.0.1:${port}`,
           'Content-Type': 'application/json',
         },
         body: {},
@@ -530,6 +631,12 @@ describe('serve.mjs HTTP server, security & routes', () => {
         if (body.conflict) {
           throw { status: 409, message: 'Giliran chat masih aktif' };
         }
+        if (body.crash) {
+          throw new Error('ENOENT: /secret/internal/path/creds.json failed');
+        }
+        if (body.crashStatus500) {
+          throw { status: 503, message: '/secret/internal/503-leak' };
+        }
         return { status: 202, body: { ok: true, queued: true } };
       },
       resolvePermission: async (body) => {
@@ -561,23 +668,58 @@ describe('serve.mjs HTTP server, security & routes', () => {
     });
 
     try {
+      const token = server.authManager.getToken();
+      const originHdr = `http://127.0.0.1:${port}`;
+
       // Unauthenticated send on loopback -> 401
       const noAuth = await rawRequest(port, {
         method: 'POST',
         reqPath: '/kerja/api/chat/send',
-        headers: { Host: `127.0.0.1:${port}`, 'Content-Type': 'application/json' },
+        headers: { Host: `127.0.0.1:${port}`, Origin: originHdr, 'Content-Type': 'application/json' },
         body: { text: 'test' },
       });
       assert.equal(noAuth.status, 401);
+      assertApiErrorHeaders(noAuth);
 
-      // Obtain session cookie via pure loopback auth
+      // Obtain session cookie via pure loopback auth (dengan Origin)
       const authRes = await rawRequest(port, {
         method: 'POST',
         reqPath: '/kerja/api/chat/auth',
-        headers: { Host: `127.0.0.1:${port}`, 'Content-Type': 'application/json' },
+        headers: { Host: `127.0.0.1:${port}`, Origin: originHdr, 'Content-Type': 'application/json' },
         body: {},
       });
+      assert.equal(authRes.status, 200);
       const cookiePair = extractCookiePair(authRes.headers['set-cookie']);
+
+      // Cookie-authenticated POST WITHOUT Origin/Referer/Sec-Fetch-Site -> 403
+      const cookieNoOrigin = await rawRequest(port, {
+        method: 'POST',
+        reqPath: '/kerja/api/chat/send',
+        headers: {
+          Host: `127.0.0.1:${port}`,
+          Cookie: cookiePair,
+          'Content-Type': 'application/json',
+        },
+        body: { text: 'no-origin' },
+      });
+      assert.equal(cookieNoOrigin.status, 403);
+      assertApiErrorHeaders(cookieNoOrigin);
+
+      // Sec-Fetch-Site: same-site (cross-port) -> 403
+      const sameSiteRes = await rawRequest(port, {
+        method: 'POST',
+        reqPath: '/kerja/api/chat/send',
+        headers: {
+          Host: `127.0.0.1:${port}`,
+          Cookie: cookiePair,
+          Origin: originHdr,
+          'Sec-Fetch-Site': 'same-site',
+          'Content-Type': 'application/json',
+        },
+        body: { text: 'same-site' },
+      });
+      assert.equal(sameSiteRes.status, 403);
+      assertApiErrorHeaders(sameSiteRes);
 
       // Cross-origin CSRF attempt with valid cookie -> 403
       const csrfRes = await rawRequest(port, {
@@ -592,6 +734,20 @@ describe('serve.mjs HTTP server, security & routes', () => {
         body: { text: 'hack' },
       });
       assert.equal(csrfRes.status, 403);
+      assertApiErrorHeaders(csrfRes);
+
+      // Explicit Bearer token WITHOUT Origin -> 200 (CLI / non-browser client)
+      const bearerNoOrigin = await rawRequest(port, {
+        method: 'POST',
+        reqPath: '/kerja/api/chat/send',
+        headers: {
+          Host: `127.0.0.1:${port}`,
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: { text: 'from-cli' },
+      });
+      assert.equal(bearerNoOrigin.status, 202);
 
       // Payload > 64 KB -> 413
       const hugePayload = JSON.stringify({ text: 'a'.repeat(66000) });
@@ -602,12 +758,13 @@ describe('serve.mjs HTTP server, security & routes', () => {
         headers: {
           Host: `127.0.0.1:${port}`,
           Cookie: cookiePair,
-          Origin: `http://127.0.0.1:${port}`,
+          Origin: originHdr,
           'Content-Type': 'application/json',
         },
         body: hugePayload,
       });
       assert.equal(tooBigRes.status, 413);
+      assertApiErrorHeaders(tooBigRes);
 
       // Invalid JSON -> 400
       const badJsonRes = await rawRequest(port, {
@@ -616,17 +773,68 @@ describe('serve.mjs HTTP server, security & routes', () => {
         headers: {
           Host: `127.0.0.1:${port}`,
           Cookie: cookiePair,
+          Origin: originHdr,
           'Content-Type': 'application/json',
         },
         body: '{not-json',
       });
       assert.equal(badJsonRes.status, 400);
+      assertApiErrorHeaders(badJsonRes);
+
+      // Non-plain-object JSON body ([], null) -> 400
+      for (const nonObj of ['[]', 'null', '"halo"']) {
+        const resNonObj = await rawRequest(port, {
+          method: 'POST',
+          reqPath: '/kerja/api/chat/send',
+          headers: {
+            Host: `127.0.0.1:${port}`,
+            Cookie: cookiePair,
+            Origin: originHdr,
+            'Content-Type': 'application/json',
+          },
+          body: nonObj,
+        });
+        assert.equal(resNonObj.status, 400);
+        assertApiErrorHeaders(resNonObj);
+      }
+
+      // Unexpected error thrown by acpBridge -> 500 without leaking raw err.message / paths
+      const crashRes = await rawRequest(port, {
+        method: 'POST',
+        reqPath: '/kerja/api/chat/send',
+        headers: {
+          Host: `127.0.0.1:${port}`,
+          Cookie: cookiePair,
+          Origin: originHdr,
+          'Content-Type': 'application/json',
+        },
+        body: { crash: true },
+      });
+      assert.equal(crashRes.status, 500);
+      assertApiErrorHeaders(crashRes);
+      assert.equal(crashRes.text.includes('/secret'), false);
+      assert.equal(crashRes.text.includes('creds.json'), false);
+
+      const crash503Res = await rawRequest(port, {
+        method: 'POST',
+        reqPath: '/kerja/api/chat/send',
+        headers: {
+          Host: `127.0.0.1:${port}`,
+          Cookie: cookiePair,
+          Origin: originHdr,
+          'Content-Type': 'application/json',
+        },
+        body: { crashStatus500: true },
+      });
+      assert.equal(crash503Res.status, 500);
+      assertApiErrorHeaders(crash503Res);
+      assert.equal(crash503Res.text.includes('/secret'), false);
 
       // Valid delegation to all bridge routes + 409 error mapping + SSE
       const sessRes = await rawRequest(port, {
         method: 'POST',
         reqPath: '/kerja/api/chat/session',
-        headers: { Host: `127.0.0.1:${port}`, Cookie: cookiePair, 'Content-Type': 'application/json' },
+        headers: { Host: `127.0.0.1:${port}`, Origin: originHdr, Cookie: cookiePair, 'Content-Type': 'application/json' },
         body: { mode: 'accept-edits' },
       });
       assert.equal(sessRes.status, 200);
@@ -635,7 +843,7 @@ describe('serve.mjs HTTP server, security & routes', () => {
       const sendRes = await rawRequest(port, {
         method: 'POST',
         reqPath: '/kerja/api/chat/send',
-        headers: { Host: `127.0.0.1:${port}`, Cookie: cookiePair, 'Content-Type': 'application/json' },
+        headers: { Host: `127.0.0.1:${port}`, Origin: originHdr, Cookie: cookiePair, 'Content-Type': 'application/json' },
         body: { text: 'Kerjakan task' },
       });
       assert.equal(sendRes.status, 202);
@@ -644,16 +852,17 @@ describe('serve.mjs HTTP server, security & routes', () => {
       const conflictRes = await rawRequest(port, {
         method: 'POST',
         reqPath: '/kerja/api/chat/send',
-        headers: { Host: `127.0.0.1:${port}`, Cookie: cookiePair, 'Content-Type': 'application/json' },
+        headers: { Host: `127.0.0.1:${port}`, Origin: originHdr, Cookie: cookiePair, 'Content-Type': 'application/json' },
         body: { conflict: true },
       });
       assert.equal(conflictRes.status, 409);
       assert.equal(conflictRes.json?.ok, false);
+      assertApiErrorHeaders(conflictRes);
 
       const permRes = await rawRequest(port, {
         method: 'POST',
         reqPath: '/kerja/api/chat/permission',
-        headers: { Host: `127.0.0.1:${port}`, Cookie: cookiePair, 'Content-Type': 'application/json' },
+        headers: { Host: `127.0.0.1:${port}`, Origin: originHdr, Cookie: cookiePair, 'Content-Type': 'application/json' },
         body: { requestId: 'p1', optionId: 'allow_once' },
       });
       assert.equal(permRes.status, 200);
@@ -661,7 +870,7 @@ describe('serve.mjs HTTP server, security & routes', () => {
       const cancelRes = await rawRequest(port, {
         method: 'POST',
         reqPath: '/kerja/api/chat/cancel',
-        headers: { Host: `127.0.0.1:${port}`, Cookie: cookiePair, 'Content-Type': 'application/json' },
+        headers: { Host: `127.0.0.1:${port}`, Origin: originHdr, Cookie: cookiePair, 'Content-Type': 'application/json' },
         body: {},
       });
       assert.equal(cancelRes.status, 200);
@@ -676,7 +885,7 @@ describe('serve.mjs HTTP server, security & routes', () => {
       assert.equal(sseRes.headers['x-frame-options'], 'DENY');
       assert.ok(sseRes.text.includes('event: ping'));
 
-      assert.equal(bridgeCalls.length, 6);
+      assert.equal(bridgeCalls.length, 9);
     } finally {
       await stopServer(server);
     }
@@ -693,18 +902,20 @@ describe('serve.mjs HTTP server, security & routes', () => {
       const resAuth = await rawRequest(disabledSrv.port, {
         method: 'POST',
         reqPath: '/kerja/api/chat/auth',
-        headers: { Host: `127.0.0.1:${disabledSrv.port}`, 'Content-Type': 'application/json' },
+        headers: { Host: `127.0.0.1:${disabledSrv.port}`, Origin: `http://127.0.0.1:${disabledSrv.port}`, 'Content-Type': 'application/json' },
         body: {},
       });
       assert.equal(resAuth.status, 503);
+      assertApiErrorHeaders(resAuth);
 
       const resSend = await rawRequest(disabledSrv.port, {
         method: 'POST',
         reqPath: '/kerja/api/chat/send',
-        headers: { Host: `127.0.0.1:${disabledSrv.port}`, 'Content-Type': 'application/json' },
+        headers: { Host: `127.0.0.1:${disabledSrv.port}`, Origin: `http://127.0.0.1:${disabledSrv.port}`, 'Content-Type': 'application/json' },
         body: {},
       });
       assert.equal(resSend.status, 503);
+      assertApiErrorHeaders(resSend);
     } finally {
       await stopServer(disabledSrv.server);
     }
@@ -730,6 +941,7 @@ describe('serve.mjs HTTP server, security & routes', () => {
         body: { text: 'halo' },
       });
       assert.equal(sendNoBridge.status, 503);
+      assertApiErrorHeaders(sendNoBridge);
 
       const streamNoBridge = await rawRequest(noBridgeSrv.port, {
         method: 'GET',
@@ -740,6 +952,7 @@ describe('serve.mjs HTTP server, security & routes', () => {
         },
       });
       assert.equal(streamNoBridge.status, 503);
+      assertApiErrorHeaders(streamNoBridge);
 
       const wrongMethod = await rawRequest(noBridgeSrv.port, {
         method: 'POST',
@@ -747,6 +960,7 @@ describe('serve.mjs HTTP server, security & routes', () => {
         headers: { Host: `127.0.0.1:${noBridgeSrv.port}` },
       });
       assert.equal(wrongMethod.status, 405);
+      assertApiErrorHeaders(wrongMethod);
 
       const notFound = await rawRequest(noBridgeSrv.port, {
         method: 'GET',
@@ -754,6 +968,7 @@ describe('serve.mjs HTTP server, security & routes', () => {
         headers: { Host: `127.0.0.1:${noBridgeSrv.port}` },
       });
       assert.equal(notFound.status, 404);
+      assertApiErrorHeaders(notFound);
     } finally {
       await stopServer(noBridgeSrv.server);
       cleanDir(env.base);
@@ -825,6 +1040,35 @@ describe('serve.mjs HTTP server, security & routes', () => {
         headers: { Host: `127.0.0.1:${port}` },
       });
       assert.equal(travAsset.status, 403);
+
+      for (const badAssetPath of [
+        '/kerja/assets/sub%5cfile.js',
+        '/kerja/assets/app%00.js',
+        '/kerja/assets/C:secret.txt',
+      ]) {
+        const badAsset = await rawRequest(port, {
+          reqPath: badAssetPath,
+          headers: { Host: `127.0.0.1:${port}` },
+        });
+        assert.equal(badAsset.status, 403, `asset path berbahaya ${badAssetPath} wajib 403`);
+      }
+
+      // Symlink escape di public/assets (graceful skip bila OS menolak symlink tanpa privilege)
+      const escapeLink = path.join(fakeRuntime, 'public', 'assets', 'escape.txt');
+      let symlinkCreated = false;
+      try {
+        fs.symlinkSync(path.join(fakeRuntime, 'secret.txt'), escapeLink);
+        symlinkCreated = true;
+      } catch (err) {
+        if (err?.code !== 'EPERM' && err?.code !== 'EACCES') throw err;
+      }
+      if (symlinkCreated) {
+        const symRes = await rawRequest(port, {
+          reqPath: '/kerja/assets/escape.txt',
+          headers: { Host: `127.0.0.1:${port}` },
+        });
+        assert.equal(symRes.status, 403);
+      }
 
       const missAsset = await rawRequest(port, {
         reqPath: '/kerja/assets/tidak-ada.js',

@@ -198,3 +198,17 @@ export function normalizeWorkspacePath(input) {
 
   return p;
 }
+
+/**
+ * Memeriksa apakah `targetPath` berada di dalam direktori `rootDir` (memastikan batas separator direktori).
+ */
+export function isInsideDir(targetPath, rootDir) {
+  if (typeof targetPath !== 'string' || typeof rootDir !== 'string' || !targetPath || !rootDir) {
+    return false;
+  }
+  const isWin = process.platform === 'win32';
+  const prefix = rootDir.endsWith(path.sep) ? rootDir : rootDir + path.sep;
+  return isWin
+    ? targetPath.toLowerCase().startsWith(prefix.toLowerCase())
+    : targetPath.startsWith(prefix);
+}
