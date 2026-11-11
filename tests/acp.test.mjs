@@ -574,13 +574,54 @@ describe('AcpBridge (lib/acp.mjs)', () => {
 
     try {
       bridge.subscribeSse(sse);
-      // Crash recovery: sessionId wajib reset ke null saat child mati
+      // Crash recovery: sessionId wajib reset ke null saat child mati,
+      // streaming assistant entry difinalisasi, dan _turnPromise bersih (null setelah settle)
       await bridge.sendPrompt('__CRASH_TURN__');
-      await bridge.waitForTurn();
+      const turnOutcome = await bridge.waitForTurn();
+      assert.equal(turnOutcome.ok, false);
       await sse.waitForEvent('turn_error');
       assert.equal(bridge.getStatus().busy, false);
       assert.equal(bridge.getStatus().connected, false);
       assert.equal(bridge.getStatus().sessionId, null);
+      assert.equal(bridge._turnPromise, null);
+      assert.equal(await bridge.waitForTurn(), null);
+      const crashedAssistant = bridge.history.find(
+        (h) => h.type === 'message' && h.role === 'assistant' && String(h.text).includes('Sebelum crash')
+      );
+      assert.ok(crashedAssistant, 'streamed assistant chunk before crash must be recorded in history');
+      assert.notEqual(crashedAssistant._streaming, true, 'streamed assistant entry must be finalized on child crash');
+
+      // Guard: stale rejection from an old crashed turn must not clobber a newly started turn's busy/lastError/turnPromise
+      const prevDelay = process.env.FAKE_AGY_PROMPT_DELAY_MS;
+      process.env.FAKE_AGY_PROMPT_DELAY_MS = '300';
+      try {
+        await bridge.createSession();
+        // Manually trigger a turn that rejects asynchronously after we start a second turn
+        await bridge.sendPrompt('__SLOW_TURN__');
+        const oldTurnPromise = bridge._turnPromise;
+        const oldChild = bridge.child;
+        // Simulate child drop -> _handleChildExit resets busy=false & _activeTurnId=0, rejects pending rpcPromise
+        bridge._handleChildExit(oldChild, 'old turn dropped', true);
+        try { oldChild?.kill('SIGKILL'); } catch {}
+        // Start a brand-new turn BEFORE oldTurnPromise's microtask runs!
+        const newTurnStartPromise = bridge.sendPrompt('__TIMED_TURN__');
+        const newStatusWhileStarting = bridge.getStatus();
+        assert.equal(newStatusWhileStarting.busy, true);
+        assert.equal(newStatusWhileStarting.lastError, null);
+        await oldTurnPromise;
+        await newTurnStartPromise;
+        // After oldTurnPromise settles, the NEW turn must STILL be busy with null lastError!
+        assert.equal(bridge.getStatus().busy, true);
+        assert.equal(bridge.getStatus().lastError, null);
+        assert.notEqual(bridge._turnPromise, null);
+        const newOutcome = await bridge.waitForTurn();
+        assert.equal(newOutcome.ok, true);
+        assert.equal(bridge.getStatus().busy, false);
+        assert.equal(bridge._turnPromise, null);
+      } finally {
+        if (prevDelay === undefined) delete process.env.FAKE_AGY_PROMPT_DELAY_MS;
+        else process.env.FAKE_AGY_PROMPT_DELAY_MS = prevDelay;
+      }
 
       // Subsequent prompt respawns transparently dan menghasilkan sessionId baru
       const recovered = await bridge.sendPrompt('Pulih kembali');
@@ -842,9 +883,10 @@ describe('AcpBridge (lib/acp.mjs)', () => {
 
       // 10. Dead child1 (exitCode !== null before 'close') respawns child2 on sendPrompt() while preserving busy lock (409)
       const bridgeRespawnBusy = new AcpBridge({ projectDir: dir, agyBin: FAKE_AGY });
+      let oldRealChild = null;
       try {
         await bridgeRespawnBusy.createSession();
-        const oldRealChild = bridgeRespawnBusy.child;
+        oldRealChild = bridgeRespawnBusy.child;
         // Buat deadChild1 yang sudah berstatus exitCode = 1 sementara 'close' belum tiba
         const deadChild1 = new EventEmitter();
         deadChild1.exitCode = 1;
@@ -869,13 +911,12 @@ describe('AcpBridge (lib/acp.mjs)', () => {
         const timedRes = await bridgeRespawnBusy.waitForTurn();
         assert.equal(timedRes.ok, true);
         assert.equal(bridgeRespawnBusy.getStatus().busy, false);
-
+      } finally {
         // Bersihkan oldRealChild yang sempat dilepas
         try {
           oldRealChild?.stdin?.end();
           oldRealChild?.kill('SIGTERM');
         } catch {}
-      } finally {
         await bridgeRespawnBusy.shutdown();
       }
 

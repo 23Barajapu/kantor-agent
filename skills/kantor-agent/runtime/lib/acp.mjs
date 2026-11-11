@@ -722,6 +722,7 @@ export class AcpBridge {
       return;
     }
 
+    this._finalizeStreamingAssistant();
     this.child = null;
     this._boundChild = null;
     this._spawnedViaCmd = false;
@@ -1229,6 +1230,8 @@ export class AcpBridge {
     this._activeTurnId = myTurnId;
     this.busy = true;
     this.lastError = null;
+    this._turnPromise = null;
+    let turnPromise = null;
 
     try {
       if (!this.sessionId) {
@@ -1279,13 +1282,15 @@ export class AcpBridge {
         null
       );
 
-      this._turnPromise = rpcPromise.then(
+      turnPromise = rpcPromise.then(
         (result) => {
-          if (this._activeTurnId === myTurnId) {
+          if (this._activeTurnId === myTurnId || (this._activeTurnId === 0 && this._turnPromise === turnPromise)) {
             this._finalizeStreamingAssistant();
             this.busy = false;
             this._activeTurnId = 0;
-            this._turnPromise = null;
+            if (this._turnPromise === turnPromise) {
+              this._turnPromise = null;
+            }
           }
           const stopReason = result?.stopReason || 'end_turn';
           this._broadcastSse('turn_done', {
@@ -1298,14 +1303,16 @@ export class AcpBridge {
           return { ok: true, result: result ?? {} };
         },
         (err) => {
-          if (this._activeTurnId === myTurnId) {
+          if (this._activeTurnId === myTurnId || (this._activeTurnId === 0 && this._turnPromise === turnPromise)) {
             this._finalizeStreamingAssistant();
             this.busy = false;
             this._activeTurnId = 0;
-            this._turnPromise = null;
+            if (this._turnPromise === turnPromise) {
+              this._turnPromise = null;
+            }
           }
           const errMsg = err?.message || 'Giliran ACP gagal';
-          if (!this.shuttingDown) {
+          if (!this.shuttingDown && (this._activeTurnId === 0 || this._activeTurnId === myTurnId)) {
             this.lastError = errMsg;
             this._pushHistory({
               type: 'error',
@@ -1322,6 +1329,7 @@ export class AcpBridge {
           return { ok: false, error: errMsg };
         }
       );
+      this._turnPromise = turnPromise;
 
       return {
         status: 202,
@@ -1332,14 +1340,15 @@ export class AcpBridge {
         },
       };
     } catch (err) {
-      if (this._activeTurnId === myTurnId) {
+      if (this._activeTurnId === myTurnId || (turnPromise !== null && this._turnPromise === turnPromise)) {
+        this._finalizeStreamingAssistant();
         this.busy = false;
         this._activeTurnId = 0;
         this._turnPromise = null;
       }
       const wasCancelled =
         Boolean(err?._cancelledMidStartup) || this.shuttingDown || turnEpoch !== this._turnEpoch;
-      if (!wasCancelled) {
+      if (!wasCancelled && (this._activeTurnId === 0 || this._activeTurnId === myTurnId)) {
         this.lastError = err?.message || 'Gagal mengirim prompt ke ACP';
         this._broadcastSse('status', this.getStatus());
       }

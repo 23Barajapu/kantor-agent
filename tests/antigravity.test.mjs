@@ -605,6 +605,14 @@ describe('antigravity.mjs', () => {
         assert.equal(resLocked.mains.length, 1);
         assert.equal(resLocked.mains[0].conversation_id, 'cached-conv-1');
 
+        if (process.platform === 'win32') {
+          const upperRoot = path.join(tmpDir, 'ANTIGRAVITY');
+          const resLockedCase = scanConversations(projDir, { window_days: 7 }, nowSec, [upperRoot]);
+          assert.equal(resLockedCase.exists, true);
+          assert.equal(resLockedCase.mains.length, 1);
+          assert.equal(resLockedCase.mains[0].conversation_id, 'cached-conv-1');
+        }
+
         // 3. Commit kunci, pembacaan berikutnya mendapat data terbaru
         writerDb.exec('COMMIT;');
         writerDb.close();

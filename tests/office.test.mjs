@@ -1424,5 +1424,134 @@ describe('office.mjs', () => {
         env.cleanup();
       }
     });
+
+    it('guards killed main session as santai and renders live bekerja state for brand-new ACP session not yet in mains', () => {
+      const env = makeEnv('kantor-off-killed-acp-');
+      try {
+        const now = Date.parse('2026-11-11T06:20:00Z');
+        const killedMainId = 'e4444444-4444-4444-8444-444444444444';
+
+        // (a) Fresh main session dengan killed: 1 wajib langsung 'santai' (tidak tertahan bekerja 90s)
+        createDb(path.join(env.agHome, 'conversation_summaries.db'), [
+          {
+            conversation_id: killedMainId,
+            title: 'Killed Main Session',
+            last_modified_time: '2026-11-11T06:19:50Z',
+            workspace_uris: env.projUri,
+            status: 'CASCADE_RUN_STATUS_RUNNING',
+            killed: 1,
+            nesting_depth: 0,
+          },
+        ]);
+        writeJsonl(env.agHome, killedMainId, [
+          { type: 'USER_INPUT', created_at: '2026-11-11T06:19:50Z', step_index: 0 },
+        ]);
+
+        const killedState = withEnvHome(env.agHome, () =>
+          buildState({
+            projectDir: env.projDir,
+            storageDir: env.storageDir,
+            cfg: env.cfg,
+            now,
+          })
+        );
+        assert.equal(killedState.ketua.state, 'santai');
+        assert.equal(killedState.ketua.activity, null);
+        assert.equal(killedState.stats.sessions_active, 0);
+
+        // (b) Brand-new ACP session yang belum terindeks di mains namun acpStatus.busy === true
+        const brandNewAcpOnIdle = withEnvHome(env.agHome, () =>
+          buildState({
+            projectDir: env.projDir,
+            storageDir: env.storageDir,
+            cfg: env.cfg,
+            now,
+            acpStatus: {
+              connected: true,
+              busy: true,
+              sessionId: 'brand-new-acp-id',
+              mode: 'accept-edits',
+              model: null,
+              sandbox: false,
+              pendingPermissionCount: 0,
+            },
+          })
+        );
+        assert.equal(brandNewAcpOnIdle.ketua.state, 'bekerja');
+        assert.equal(brandNewAcpOnIdle.ketua.activity, 'aktif');
+        assert.equal(brandNewAcpOnIdle.ketua.session, 'brand-ne');
+        assert.equal(brandNewAcpOnIdle.stats.sessions_active, 1);
+        assert.equal(brandNewAcpOnIdle.ketua.other_sessions, 0);
+        assert.ok(Array.isArray(brandNewAcpOnIdle.ketua.last) && brandNewAcpOnIdle.ketua.last.length > 0);
+        assert.ok(brandNewAcpOnIdle.ketua.last[0].text.length > 0);
+
+        // Juga ketika scan.mains kosong sama sekali (proyek baru tanpa DB)
+        fs.rmSync(path.join(env.agHome, 'conversation_summaries.db'), { force: true });
+        const brandNewAcpEmpty = withEnvHome(env.agHome, () =>
+          buildState({
+            projectDir: env.projDir,
+            storageDir: env.storageDir,
+            cfg: env.cfg,
+            now,
+            acpStatus: {
+              connected: true,
+              busy: true,
+              sessionId: 'brand-new-acp-id',
+              mode: 'accept-edits',
+              model: null,
+              sandbox: false,
+              pendingPermissionCount: 0,
+            },
+          })
+        );
+        assert.equal(brandNewAcpEmpty.ketua.state, 'bekerja');
+        assert.equal(brandNewAcpEmpty.ketua.activity, 'aktif');
+        assert.equal(brandNewAcpEmpty.ketua.session, 'brand-ne');
+        assert.equal(brandNewAcpEmpty.stats.sessions_active, 1);
+        assert.equal(brandNewAcpEmpty.ketua.other_sessions, 0);
+        assert.ok(Array.isArray(brandNewAcpEmpty.ketua.last) && brandNewAcpEmpty.ketua.last.length > 0);
+        assert.ok(brandNewAcpEmpty.ketua.last[0].text.length > 0);
+
+        // Ketika ada sesi IDE lain yang juga aktif bekerja bersamaan dengan sesi ACP baru
+        const runningIdeId = 'e5555555-5555-4555-8555-555555555555';
+        createDb(path.join(env.agHome, 'conversation_summaries.db'), [
+          {
+            conversation_id: runningIdeId,
+            title: 'IDE Active',
+            last_modified_time: '2026-11-11T06:19:55Z',
+            workspace_uris: env.projUri,
+            status: 'CASCADE_RUN_STATUS_RUNNING',
+            nesting_depth: 0,
+          },
+        ]);
+        writeJsonl(env.agHome, runningIdeId, [
+          { type: 'USER_INPUT', created_at: '2026-11-11T06:19:55Z', step_index: 0 },
+        ]);
+        const brandNewWithActiveIde = withEnvHome(env.agHome, () =>
+          buildState({
+            projectDir: env.projDir,
+            storageDir: env.storageDir,
+            cfg: env.cfg,
+            now,
+            acpStatus: {
+              connected: true,
+              busy: true,
+              sessionId: 'brand-new-acp-id',
+              mode: 'accept-edits',
+              model: null,
+              sandbox: false,
+              pendingPermissionCount: 0,
+            },
+          })
+        );
+        assert.equal(brandNewWithActiveIde.ketua.state, 'bekerja');
+        assert.equal(brandNewWithActiveIde.ketua.activity, 'aktif');
+        assert.equal(brandNewWithActiveIde.ketua.session, 'brand-ne');
+        assert.equal(brandNewWithActiveIde.stats.sessions_active, 2);
+        assert.equal(brandNewWithActiveIde.ketua.other_sessions, 1);
+      } finally {
+        env.cleanup();
+      }
+    });
   });
 });

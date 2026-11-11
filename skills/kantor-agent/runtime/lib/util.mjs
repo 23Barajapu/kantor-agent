@@ -29,8 +29,9 @@ export function mbLen(s) {
 
 export function clip(s, n) {
   s = String(s);
+  if (n <= 0) return '';
   if (mbLen(s) <= n) return s;
-  return `${Array.from(s).slice(0, n - 1).join('')}…`;
+  return `${Array.from(s).slice(0, Math.max(0, n - 1)).join('')}…`;
 }
 
 // strcmp PHP: urutan byte UTF-8

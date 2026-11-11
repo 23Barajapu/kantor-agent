@@ -502,8 +502,13 @@ describe('artifacts.mjs', () => {
   describe('readSafeArtifact (Review Focus #2b)', () => {
     const validConvId = 'f1a2b3c4-d5e6-4a7b-8c9d-0e1f2a3b4c5d';
 
-    it('rejects invalid or unallowed convId with status 404', () => {
+    it('rejects invalid or unallowed convId with status 404 and handles no-arg call safely', () => {
       const allowed = new Set([validConvId]);
+
+      const emptyCall = readSafeArtifact();
+      assert.equal(emptyCall.ok, false);
+      assert.equal(emptyCall.status, 404);
+      assert.equal(emptyCall.error, 'Artifact tidak ditemukan');
 
       // Invalid UUID formats
       let res = readSafeArtifact({ convId: 'invalid-id', relPath: 'task.md', allowedConvIds: allowed });
@@ -571,6 +576,9 @@ describe('artifacts.mjs', () => {
           'unsupported.py',
           'binary.exe',
           'archive.zip',
+          'sub /note.md',
+          'note.md.',
+          'sub./note.md',
         ];
 
         for (const bad of badPaths) {

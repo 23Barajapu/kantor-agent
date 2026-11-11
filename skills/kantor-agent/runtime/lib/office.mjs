@@ -300,16 +300,21 @@ function resolveKetuaState(scanMains, runs, acpStatus, now, maMs, rwMs, cdMs) {
     });
 
   const mainState = (m) => {
+    const isAcpBusy = isAcpBusySession(m);
+    if (m.killed && !isAcpBusy) {
+      return ['santai', null];
+    }
+
     const updMs = m.updated ? tsMs(m.updated) : null;
     const age =
       updMs !== null
         ? now - updMs
-        : m.status === 'CASCADE_RUN_STATUS_RUNNING' || isAcpBusySession(m)
+        : m.status === 'CASCADE_RUN_STATUS_RUNNING' || isAcpBusy
           ? 0
           : Number.POSITIVE_INFINITY;
     const activeKids = kids.get(m.id) ?? 0;
 
-    if (m.status === 'CASCADE_RUN_STATUS_RUNNING' || isAcpBusySession(m)) {
+    if (m.status === 'CASCADE_RUN_STATUS_RUNNING' || isAcpBusy) {
       return ['bekerja', 'aktif'];
     }
     if (activeKids > 0 || m.not_fully_idle === 1) {
@@ -328,10 +333,10 @@ function resolveKetuaState(scanMains, runs, acpStatus, now, maMs, rwMs, cdMs) {
   };
 
   const states = mains.map(mainState);
-  let di = -1;
-  if (acpStatus?.busy && acpStatus.sessionId) {
-    di = mains.findIndex((m) => m.id === acpStatus.sessionId);
-  }
+  const acpIdx = acpStatus?.busy && acpStatus.sessionId
+    ? mains.findIndex((m) => m.id === acpStatus.sessionId)
+    : -1;
+  let di = acpIdx;
   if (di < 0) {
     di = states.findIndex((s) => s[0] === 'bekerja');
   }
@@ -339,11 +344,18 @@ function resolveKetuaState(scanMains, runs, acpStatus, now, maMs, rwMs, cdMs) {
     di = mains.length > 0 ? 0 : -1;
   }
 
-  const dm = di >= 0 ? mains[di] : null;
-  const activeMains = states.filter((s) => s[0] === 'bekerja').length;
+  const isUnindexedAcpSession = Boolean(acpStatus?.busy && acpStatus.sessionId && acpIdx === -1);
+  const dm = isUnindexedAcpSession ? null : (di >= 0 ? mains[di] : null);
+  let dmState = dm ? states[di] : ['santai', null];
+  let activeMains = states.filter((s) => s[0] === 'bekerja').length;
+
+  if (acpStatus?.busy && (isUnindexedAcpSession || di === -1 || dmState[0] !== 'bekerja')) {
+    dmState = ['bekerja', 'aktif'];
+    activeMains = isUnindexedAcpSession ? activeMains + 1 : Math.max(activeMains, 1);
+  }
 
   let todos = dm?.brainDir ? extractTodos(dm.brainDir) : null;
-  if (todos === null && dm !== null) {
+  if (todos === null && (dm !== null || (acpStatus?.busy && mains.length > 0))) {
     for (const m of mains) {
       if (m === dm || !m.brainDir) continue;
       const cand = extractTodos(m.brainDir);
@@ -359,7 +371,7 @@ function resolveKetuaState(scanMains, runs, acpStatus, now, maMs, rwMs, cdMs) {
   return {
     mains,
     dm,
-    dmState: dm ? states[di] : ['santai', null],
+    dmState,
     activeMains,
     kids,
     todos,
@@ -566,6 +578,22 @@ export function buildState({ projectDir, storageDir = null, cfg = {}, now = Date
   const ketuaData = resolveKetuaState(scan.mains, runs, acpStatus, now, MA, RW, CD);
   const { mains, dm, dmState, activeMains, kids, todos, artifacts } = ketuaData;
 
+  const ketuaUpdated = dm ? dm.updated : (acpStatus?.busy ? isoMs(now) : null);
+  const ketuaLast = dm
+    ? [...(dm.events ?? [])]
+        .reverse()
+        .filter((e) => e.kind !== 'text' && e.tool !== 'invoke_subagent')
+        .slice(0, 8)
+    : [];
+  if (acpStatus?.busy && ketuaLast.length === 0) {
+    ketuaLast.push({
+      t: ketuaUpdated || isoMs(now),
+      kind: 'acp',
+      text: 'Memproses instruksi ACP…',
+      tool: null,
+    });
+  }
+
   const ketua = {
     key: 'ketua',
     name: ketuaName,
@@ -575,18 +603,15 @@ export function buildState({ projectDir, storageDir = null, cfg = {}, now = Date
     color: ketuaColor,
     state: dmState[0],
     activity: dmState[1],
-    session: dm ? dm.id.slice(0, 8) : null,
-    updated: dm ? dm.updated : null,
-    last: dm
-      ? [...(dm.events ?? [])]
-          .reverse()
-          .filter((e) => e.kind !== 'text' && e.tool !== 'invoke_subagent')
-          .slice(0, 8)
-      : [],
+    session: acpStatus?.busy && acpStatus.sessionId
+      ? acpStatus.sessionId.slice(0, 8)
+      : (dm ? dm.id.slice(0, 8) : null),
+    updated: ketuaUpdated,
+    last: ketuaLast,
     tools: dm ? countTools(dm) : 0,
     tokens: dm ? totalTokens(dm.tokens) : 0,
     waiting_on: dm ? kids.get(dm.id) ?? 0 : 0,
-    other_sessions: Math.max(0, activeMains - (dm && dmState[0] === 'bekerja' ? 1 : 0)),
+    other_sessions: Math.max(0, activeMains - (dmState[0] === 'bekerja' ? 1 : 0)),
     sessions: mains.length,
     todos,
     artifacts,

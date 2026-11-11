@@ -151,10 +151,13 @@ describe('util.mjs', () => {
       assert.equal(mbLen('👋🌍'), 2);
     });
 
-    it('clip truncates multibyte text with ellipsis', () => {
+    it('clip truncates multibyte text with ellipsis and handles n <= 0 safely', () => {
       assert.equal(clip('hello world', 5), 'hell…');
       assert.equal(clip('hello', 10), 'hello');
       assert.equal(clip('halo dunia', 4), 'hal…');
+      assert.equal(clip('halo', 0), '');
+      assert.equal(clip('halo', -2), '');
+      assert.equal(clip('halo', 1), '…');
     });
 
     it('phpTrim and phpLtrim trim standard whitespace and control chars', () => {
@@ -284,7 +287,7 @@ describe('util.mjs', () => {
 });
 
 describe('config.mjs', () => {
-  const runtimeDir = path.resolve('skills/kantor-agent/runtime');
+  const runtimeDir = path.resolve(import.meta.dirname, '..', 'skills', 'kantor-agent', 'runtime');
 
   it('exports CONFIG_REL pointing to .agents/kantor-agent.json', () => {
     assert.equal(CONFIG_REL, '.agents/kantor-agent.json');
@@ -619,8 +622,66 @@ describe('config.mjs', () => {
       );
       process.env.KANTOR_SANDBOX = '0';
       assert.equal(loadConfig(runtimeDir, tmpProject, { sandbox: true }).chat.sandbox, true);
+
+      // Case G: empty/whitespace KANTOR_SANDBOX is treated as unset (does not override file=true)
+      fs.writeFileSync(
+        path.join(tmpProject, CONFIG_REL),
+        JSON.stringify({ chat: { sandbox: true } }),
+        'utf8'
+      );
+      process.env.KANTOR_SANDBOX = '';
+      assert.equal(loadConfig(runtimeDir, tmpProject).chat.sandbox, true);
+      process.env.KANTOR_SANDBOX = '   ';
+      assert.equal(loadConfig(runtimeDir, tmpProject).chat.sandbox, true);
     } finally {
       delete process.env.KANTOR_SANDBOX;
+      fs.rmSync(tmpProject, { recursive: true, force: true });
+    }
+  });
+
+  it('loadConfig safely merges partial colors and caps port within 1..65535', () => {
+    const tmpProject = fs.mkdtempSync(path.join(os.tmpdir(), 'kantor-test-colors-port-'));
+    const agentsDir = path.join(tmpProject, '.agents');
+    fs.mkdirSync(agentsDir, { recursive: true });
+    const defaults = loadDefaults(runtimeDir);
+
+    try {
+      fs.writeFileSync(
+        path.join(tmpProject, CONFIG_REL),
+        JSON.stringify({
+          port: 99999,
+          colors: {
+            ketua: '#111111',
+            team: ['#222222', ''],
+            freelancers: [],
+          },
+        }),
+        'utf8'
+      );
+
+      const cfg1 = loadConfig(runtimeDir, tmpProject);
+      assert.equal(cfg1.port, 8788);
+      assert.equal(cfg1.colors.ketua, '#111111');
+      assert.deepEqual(cfg1.colors.team, ['#222222', ...defaults.colors.team.slice(1)]);
+      assert.deepEqual(cfg1.colors.freelancers, defaults.colors.freelancers);
+
+      fs.writeFileSync(
+        path.join(tmpProject, CONFIG_REL),
+        JSON.stringify({
+          port: 9001,
+          colors: {
+            freelancers: ['#aaaaaa', '   ', '#bbbbbb'],
+          },
+        }),
+        'utf8'
+      );
+
+      const cfg2 = loadConfig(runtimeDir, tmpProject);
+      assert.equal(cfg2.port, 9001);
+      assert.equal(cfg2.colors.ketua, defaults.colors.ketua);
+      assert.deepEqual(cfg2.colors.team, defaults.colors.team);
+      assert.deepEqual(cfg2.colors.freelancers, ['#aaaaaa', '#bbbbbb']);
+    } finally {
       fs.rmSync(tmpProject, { recursive: true, force: true });
     }
   });

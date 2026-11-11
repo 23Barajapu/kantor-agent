@@ -710,21 +710,32 @@ function detectStartFlagMismatches(args, existing) {
   return diffs;
 }
 
+function storageFlagHint(storageDir, projectDir) {
+  const resolvedStorage = path.resolve(storageDir);
+  const resolvedDefault = path.resolve(defaultStorageDir(projectDir));
+  const isCustom =
+    process.platform === 'win32'
+      ? resolvedStorage.toLowerCase() !== resolvedDefault.toLowerCase()
+      : resolvedStorage !== resolvedDefault;
+  return isCustom ? ` --storage "${storageDir}"` : '';
+}
+
 function printStartSummary({ header, url, bind, storageDir, projectDir, mismatchNote = '' }) {
   const selfScript = path.join(RUNTIME_DIR, 'bin', 'kantor.mjs');
   const tokenFile = path.join(storageDir, 'chat-token');
+  const storageOpt = storageFlagHint(storageDir, projectDir);
   const lines = [header, `URL       : ${url}`];
   if (mismatchNote) {
     lines.push(`Catatan   : ${mismatchNote}`);
   }
   lines.push(`File token: ${tokenFile}`);
   if (!isLoopbackBind(bind)) {
-    lines.push(`Token cmd : node "${selfScript}" token --project "${projectDir}"`);
+    lines.push(`Token cmd : node "${selfScript}" token --project "${projectDir}"${storageOpt}`);
     lines.push('Keamanan  : bind non-loopback aktif; jalankan perintah token secara terpisah agar secret tidak tercetak ke transkrip.');
   } else {
-    lines.push(`Token cmd : node "${selfScript}" token --project "${projectDir}" (otomatis di localhost)`);
+    lines.push(`Token cmd : node "${selfScript}" token --project "${projectDir}"${storageOpt} (otomatis di localhost)`);
   }
-  lines.push(`Stop      : node "${selfScript}" stop --project "${projectDir}"`);
+  lines.push(`Stop      : node "${selfScript}" stop --project "${projectDir}"${storageOpt}`);
   process.stdout.write(`${lines.join('\n')}\n`);
 }
 
@@ -1037,12 +1048,13 @@ function handleToken(args) {
 function printTunnelSummary({ header, url, storageDir, projectDir }) {
   const selfScript = path.join(RUNTIME_DIR, 'bin', 'kantor.mjs');
   const tokenFile = path.join(storageDir, 'chat-token');
+  const storageOpt = storageFlagHint(storageDir, projectDir);
   process.stdout.write(
     [
       header,
       `URL Publik : ${url}`,
       `File token : ${tokenFile}`,
-      `Token cmd  : node "${selfScript}" token --project "${projectDir}"`,
+      `Token cmd  : node "${selfScript}" token --project "${projectDir}"${storageOpt}`,
       'Keamanan   : Autentikasi chat & eksekusi Ketua wajib memakai chat-token. Jangan salin nilai token ke percakapan/log publik.',
     ].join('\n') + '\n'
   );

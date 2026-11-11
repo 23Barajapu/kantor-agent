@@ -104,7 +104,8 @@ function parseWorkspaceUris(raw) {
 }
 
 function readDbRows(dbPath) {
-  const cacheKey = path.resolve(dbPath);
+  const resolvedDbPath = path.resolve(dbPath);
+  const cacheKey = process.platform === 'win32' ? resolvedDbPath.toLowerCase() : resolvedDbPath;
   if (!isFile(dbPath)) return [];
 
   let db;

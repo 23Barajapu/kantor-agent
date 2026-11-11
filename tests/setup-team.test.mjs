@@ -424,6 +424,10 @@ describe('Task 9: rules/AGENTS.md, IT specialist templates, setupTeam, and CLI l
         startRes.stdout.includes(`http://127.0.0.1:${port}/kerja`),
         `start output should include URL on port ${port}, got: ${startRes.stdout}`
       );
+      const startTokenLine = startRes.stdout.split(/\r?\n/).find((l) => l.startsWith('Token cmd'));
+      const startStopLine = startRes.stdout.split(/\r?\n/).find((l) => l.startsWith('Stop'));
+      assert.ok(startTokenLine && startTokenLine.includes(`--storage "${storageDir}"`), `Loopback Token cmd must include --storage: ${startTokenLine}`);
+      assert.ok(startStopLine && startStopLine.includes(`--storage "${storageDir}"`), `Loopback Stop must include --storage: ${startStopLine}`);
 
       const serverJsonPath = path.join(storageDir, 'server.json');
       assert.ok(fs.existsSync(serverJsonPath), 'server.json must be created by start');
@@ -610,9 +614,9 @@ describe('Task 9: rules/AGENTS.md, IT specialist templates, setupTeam, and CLI l
     const env = { KANTOR_STORAGE: storageDir, ANTIGRAVITY_HOME: agyHome };
 
     try {
-      // 1. Start with --bind 0.0.0.0
+      // 1. Start with --bind 0.0.0.0 and KANTOR_STORAGE only (no --storage flag) to verify custom storage hints
       const start1 = await runKantorCli(
-        ['start', '--project', projectDir, '--storage', storageDir, '--bind', '0.0.0.0', '--port', String(port)],
+        ['start', '--project', projectDir, '--bind', '0.0.0.0', '--port', String(port)],
         env
       );
       const tokenPath = path.join(storageDir, 'chat-token');
@@ -625,6 +629,10 @@ describe('Task 9: rules/AGENTS.md, IT specialist templates, setupTeam, and CLI l
       assert.equal(start1.stdout.includes('?token='), false, 'start stdout must not print ?token=');
       assert.ok(start1.stdout.includes(tokenPath), 'start stdout must print chat-token file path');
       assert.match(start1.stdout, /\btoken\b/);
+      const tokenCmdLine = start1.stdout.split(/\r?\n/).find((l) => l.startsWith('Token cmd'));
+      const stopCmdLine = start1.stdout.split(/\r?\n/).find((l) => l.startsWith('Stop'));
+      assert.ok(tokenCmdLine && tokenCmdLine.includes(`--storage "${storageDir}"`), `Token cmd must include --storage "${storageDir}", got: ${tokenCmdLine}`);
+      assert.ok(stopCmdLine && stopCmdLine.includes(`--storage "${storageDir}"`), `Stop cmd must include --storage "${storageDir}", got: ${stopCmdLine}`);
 
       const meta1 = JSON.parse(fs.readFileSync(path.join(storageDir, 'server.json'), 'utf8'));
       assert.equal(meta1.bind, '0.0.0.0');
@@ -847,13 +855,15 @@ describe('Task 9: rules/AGENTS.md, IT specialist templates, setupTeam, and CLI l
       assert.equal(fs.existsSync(path.join(storageDir, 'tunnel.json')), false);
       assert.equal(fs.existsSync(path.join(storageDir, 'tunnel-url.txt')), false);
 
-      // 2. Success mode prints public URL + token file path without printing raw token or ?token=
+      // 2. Success mode prints public URL + token file path + --storage hint without printing raw token or ?token=
       const tunOk = await runKantorCli(
         ['tunnel', '--project', projectDir, '--storage', storageDir],
         { ...baseEnv, FAKE_CF_MODE: 'ok' }
       );
       assert.ok(tunOk.stdout.includes('https://kantor-demo-tunnel.trycloudflare.com/kerja'));
       assert.ok(tunOk.stdout.includes(path.join(storageDir, 'chat-token')));
+      const tunTokenCmdLine = tunOk.stdout.split(/\r?\n/).find((l) => l.startsWith('Token cmd'));
+      assert.ok(tunTokenCmdLine && tunTokenCmdLine.includes(`--storage "${storageDir}"`), `Tunnel Token cmd must include --storage "${storageDir}", got: ${tunTokenCmdLine}`);
       assert.equal(tunOk.stdout.includes(rawToken), false, 'tunnel stdout must not print raw chat-token');
       assert.equal(tunOk.stdout.includes('?token='), false, 'tunnel stdout must not print ?token=');
       assert.equal(

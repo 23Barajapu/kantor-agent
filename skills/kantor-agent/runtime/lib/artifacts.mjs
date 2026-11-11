@@ -48,6 +48,7 @@ function isSafeRelativePath(rel) {
   for (const seg of segments) {
     if (!seg || seg === '.' || seg === '..') return false;
     if (seg.startsWith('.')) return false;
+    if (seg.endsWith(' ') || seg.endsWith('.')) return false;
     if (seg.toLowerCase() === 'scratch') return false;
   }
   const baseName = segments[segments.length - 1].toLowerCase();
@@ -378,7 +379,7 @@ export function extractTodos(brainDir) {
  * @param {boolean} [params.isLoopback]
  * @returns {{ ok: boolean, status: number, kind?: 'json'|'file', contentType?: string, data?: object|Buffer, error?: string }}
  */
-export function readSafeArtifact({ convId, relPath, allowedConvIds, roots, isLoopback }) {
+export function readSafeArtifact({ convId, relPath, allowedConvIds, roots, isLoopback } = {}) {
   if (typeof convId !== 'string' || !UUID_REGEX.test(convId)) {
     return { ok: false, status: 404, error: 'Artifact tidak ditemukan' };
   }
@@ -405,14 +406,7 @@ export function readSafeArtifact({ convId, relPath, allowedConvIds, roots, isLoo
     return { ok: false, status: 403, error: 'Akses artifact ditolak' };
   }
 
-  const segments = relPath.split(/[/\\]/);
-  for (const seg of segments) {
-    if (seg === '' || seg === '..' || seg.startsWith('.') || seg.toLowerCase() === 'scratch') {
-      return { ok: false, status: 403, error: 'Akses artifact ditolak' };
-    }
-  }
-
-  if (relPath.toLowerCase().endsWith('.metadata.json')) {
+  if (!isSafeRelativePath(relPath)) {
     return { ok: false, status: 403, error: 'Akses artifact ditolak' };
   }
 

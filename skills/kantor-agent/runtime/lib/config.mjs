@@ -58,6 +58,27 @@ function parse(file) {
 }
 
 const num = (v, d) => (Number.isInteger(v) && v > 0 ? v : d);
+const cleanPort = (v, d = 8788) => (Number.isInteger(v) && v >= 1 && v <= 65535 ? v : d);
+
+function mergeColors(defColors, customColors) {
+  const def = isPlainObj(defColors) ? defColors : {};
+  const custom = isPlainObj(customColors) ? customColors : {};
+  const ketua =
+    typeof custom.ketua === 'string' && custom.ketua.trim() !== ''
+      ? custom.ketua.trim()
+      : def.ketua;
+  const defTeam = Array.isArray(def.team) ? def.team : [];
+  const rawTeam = Array.isArray(custom.team) ? custom.team : [];
+  const team = defTeam.map((dVal, i) =>
+    typeof rawTeam[i] === 'string' && rawTeam[i].trim() !== '' ? rawTeam[i].trim() : dVal
+  );
+  const rawFl = Array.isArray(custom.freelancers)
+    ? custom.freelancers.filter((c) => typeof c === 'string' && c.trim() !== '').map((c) => c.trim())
+    : [];
+  const freelancers =
+    rawFl.length > 0 ? rawFl : Array.isArray(def.freelancers) ? [...def.freelancers] : [];
+  return { ketua, team, freelancers };
+}
 
 export function loadDefaults(runtimeDir) {
   const defaultsFile = path.join(runtimeDir, 'defaults.json');
@@ -122,8 +143,9 @@ export function loadConfig(runtimeDir, projectDir, opts = {}) {
   if (typeof cc.sandbox === 'boolean') {
     sandbox = cc.sandbox;
   }
-  if (process.env.KANTOR_SANDBOX !== undefined) {
-    sandbox = process.env.KANTOR_SANDBOX === '1' || process.env.KANTOR_SANDBOX === 'true';
+  const rawSandboxEnv = typeof process.env.KANTOR_SANDBOX === 'string' ? process.env.KANTOR_SANDBOX.trim() : '';
+  if (rawSandboxEnv !== '') {
+    sandbox = rawSandboxEnv === '1' || rawSandboxEnv.toLowerCase() === 'true';
   }
   if (opts?.sandbox !== undefined) {
     sandbox = Boolean(opts.sandbox);
@@ -145,9 +167,9 @@ export function loadConfig(runtimeDir, projectDir, opts = {}) {
     team: d.team.map((def, i) => cleanName(team[i]) ?? def),
     divisions,
     freelancers: fl.length ? fl : d.freelancers,
-    colors: isPlainObj(c.colors) ? c.colors : d.colors,
+    colors: mergeColors(d.colors, c.colors),
     bind,
-    port: num(c.port, 8788),
+    port: cleanPort(c.port, cleanPort(d.port, 8788)),
     autostart: Boolean(c.autostart ?? d.autostart ?? false),
     window_days: num(c.window_days, num(d.window_days, 7)),
     running_window: num(c.running_window, num(d.running_window, 900)),
