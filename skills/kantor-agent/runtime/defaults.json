@@ -1,0 +1,50 @@
+{
+  "ketua": "Joko",
+  "ketua_role": "Lead Architect",
+  "team": ["Budi", "Sari", "Agus", "Rina"],
+  "divisions": [
+    {
+      "id": "frontend",
+      "label": "Frontend & UI",
+      "match_types": ["frontend-ui-dev"],
+      "match_keywords": ["frontend", "ui", "ux", "css", "tailwind", "react", "next", "vue", "animat", "motion", "figma", "canva", "a11y", "remotion", "mobile", "layout", "design-to-code"]
+    },
+    {
+      "id": "backend",
+      "label": "Backend & AI",
+      "match_types": ["backend-architect"],
+      "match_keywords": ["backend", "api", "database", "sql", "schema", "architect", "domain", "migration", "refactor", "performance", "observability", "sdk", "gemini", "mcp", "server", "endpoint"]
+    },
+    {
+      "id": "qa",
+      "label": "QA & Security",
+      "match_types": ["qa-security-engineer", "browser"],
+      "match_keywords": ["qa", "test", "tdd", "debug", "bug", "security", "audit", "review", "verify", "devtools", "cookie", "leak", "lcp", "browser"]
+    },
+    {
+      "id": "product_ops",
+      "label": "Product & Ops",
+      "match_types": ["product-ops-researcher", "research"],
+      "match_keywords": ["research", "spec", "prd", "plan", "brainstorm", "doc", "adr", "ci", "cd", "git", "pr", "issue", "release", "ship", "triage", "gdocs", "gdrive", "gsheets", "gslides", "ops"]
+    }
+  ],
+  "freelancers": ["Yoga", "Dewi", "Rudi", "Maya", "Eko", "Nina", "Fajar", "Wulan", "Dimas", "Lestari", "Hendra", "Tika"],
+  "colors": {
+    "ketua": "#6a55c9",
+    "team": ["#3f6fd1", "#2f9a6d", "#d9772f", "#c2417a"],
+    "freelancers": ["#0f8fa3", "#9a7418", "#4f7d3a", "#8a4fa8", "#3d7f9e", "#b8452f"]
+  },
+  "bind": "127.0.0.1",
+  "window_days": 7,
+  "running_window": 900,
+  "main_active": 90,
+  "cooldown": 60,
+  "spare_desks": 4,
+  "mains_max": 40,
+  "chat": {
+    "enabled": true,
+    "default_mode": "accept-edits",
+    "default_model": null,
+    "sandbox": false
+  }
+}

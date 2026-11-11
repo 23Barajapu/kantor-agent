@@ -1,0 +1,16 @@
+{
+  "name": "kantor-agent",
+  "displayName": "Kantor Agent",
+  "version": "1.0.0",
+  "description": "Kantor 3D real-time agent monitoring and interactive ACP chat for Antigravity",
+  "license": "MIT",
+  "keywords": [
+    "antigravity",
+    "monitoring",
+    "subagents",
+    "office",
+    "chat",
+    "acp",
+    "threejs"
+  ]
+}

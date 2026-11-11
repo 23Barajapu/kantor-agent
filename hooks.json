@@ -1,0 +1,12 @@
+{
+  "kantor-autostart": {
+    "enabled": true,
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "node ./skills/kantor-agent/runtime/bin/kantor.mjs autostart",
+        "timeout": 10
+      }
+    ]
+  }
+}
