@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { loadConfig } from '../lib/config.mjs';
 import { buildState } from '../lib/office.mjs';
 import { scanConversations } from '../lib/antigravity.mjs';
+import { isCliMain } from '../lib/transcripts.mjs';
 import { readSafeArtifact } from '../lib/artifacts.mjs';
 import { AcpBridge } from '../lib/acp.mjs';
 import { isDir, isFile, isInsideDir, isPlainObj, isoMs } from '../lib/util.mjs';
@@ -364,16 +365,6 @@ async function handleChat(req, res, pathname, method, { cfg, authManager, acpBri
   }
 }
 
-function isCliMainRow(row) {
-  if (!row || row.nesting_depth !== 0 || row.parent_conversation_id) return false;
-  if (row.source === 'CORTEX_TRAJECTORY_SOURCE_CLI') return true;
-  const dbRootClean = String(row.dbRoot || '')
-    .replace(/[\\/]+$/, '')
-    .replaceAll('\\', '/')
-    .toLowerCase();
-  return path.posix.basename(dbRootClean) === 'antigravity-cli' && row.app_data_dir !== 'antigravity';
-}
-
 /**
  * Membuat instance `http.Server` Kantor Agent lengkap dengan header keamanan,
  * validasi Host, pure-loopback auto-auth, endpoint monitoring, artifact, dan chat ACP.
@@ -393,6 +384,9 @@ export function createKantorServer(opts = {}) {
     acpBridge = opts.acpBridge;
   } else if (cfg?.chat?.enabled !== false) {
     const isSessionRunningOutsideAcp = (id) => {
+      if (acpBridge?.connected && id === acpBridge.sessionId) {
+        return false;
+      }
       const scan = scanConversations(projectDir, cfg);
       const row = scan.mains.find((r) => r.conversation_id === id);
       if (!row) return false;
@@ -400,7 +394,7 @@ export function createKantorServer(opts = {}) {
     };
     const isCliSession = (id) => {
       const scan = scanConversations(projectDir, cfg);
-      return scan.mains.some((r) => r.conversation_id === id && isCliMainRow(r));
+      return scan.mains.some((r) => r.conversation_id === id && isCliMain(r));
     };
     acpBridge = new AcpBridge({
       projectDir,

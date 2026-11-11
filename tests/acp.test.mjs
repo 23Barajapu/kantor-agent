@@ -374,6 +374,17 @@ describe('AcpBridge (lib/acp.mjs)', () => {
       assert.equal(loaded.sessionId, 'cli-idle');
       assert.equal(bridge.getStatus().sessionId, 'cli-idle');
       assert.equal(bridge.getStatus().connected, true);
+
+      // Memuat ulang sesi yang sudah aktif pada bridge ini berhasil tanpa false-positive 409
+      runningSet.add('cli-idle');
+      const reloadedSame = await bridge.loadSession('cli-idle');
+      assert.equal(reloadedSame.ok, true);
+      assert.equal(reloadedSame.sessionId, 'cli-idle');
+
+      // Namun saat busy === true, loadSession wajib menolak 409
+      bridge.busy = true;
+      await assert.rejects(() => bridge.loadSession('cli-idle'), (err) => err?.status === 409);
+      bridge.busy = false;
     } finally {
       await bridge.shutdown();
       cleanDir(dir);
@@ -535,19 +546,28 @@ describe('AcpBridge (lib/acp.mjs)', () => {
 
     try {
       bridge.subscribeSse(sse);
-      // Crash recovery
+      // Crash recovery: sessionId wajib reset ke null saat child mati
       await bridge.sendPrompt('__CRASH_TURN__');
       await bridge.waitForTurn();
       await sse.waitForEvent('turn_error');
       assert.equal(bridge.getStatus().busy, false);
       assert.equal(bridge.getStatus().connected, false);
+      assert.equal(bridge.getStatus().sessionId, null);
 
-      // Subsequent prompt respawns transparently
+      // Subsequent prompt respawns transparently dan menghasilkan sessionId baru
       const recovered = await bridge.sendPrompt('Pulih kembali');
       assert.equal(recovered.status, 202);
       await bridge.waitForTurn();
       assert.equal(bridge.getStatus().connected, true);
       assert.equal(bridge.getStatus().busy, false);
+      assert.ok(bridge.getStatus().sessionId);
+
+      // Oversized stdout line > 4 MB dibuang aman tanpa crash & baris valid berikutnya tetap terbaca
+      const oversizedRes = await bridge.sendPrompt('__OVERSIZED_STDOUT__');
+      assert.equal(oversizedRes.status, 202);
+      await bridge.waitForTurn();
+      await sse.waitForEvent('error', 3000, (d) => String(d.error).includes('4 MB'));
+      await sse.waitForEvent('session_update', 3000, (d) => String(d.text).includes('Pulih setelah baris >4MB'));
 
       // Push > 200 history entries via _pushHistory / updates
       for (let i = 0; i < 250; i++) {
@@ -559,6 +579,95 @@ describe('AcpBridge (lib/acp.mjs)', () => {
       assert.equal(hist[199].text, 'msg-249');
     } finally {
       await bridge.shutdown();
+      cleanDir(dir);
+    }
+  });
+
+  it('supports createSession({ mode, model }) single-RPC setup, sendPrompt pre-validation, rpcTimeoutMs (not prompt), Windows .cmd, and post-shutdown idempotency', async () => {
+    const dir = makeTempDir('kantor-acp-hardening-');
+    const rpcLog = path.join(dir, 'rpc.log');
+    const prevRpcLog = process.env.FAKE_AGY_RPC_LOG;
+    const prevDelay = process.env.FAKE_AGY_PROMPT_DELAY_MS;
+    const prevHangInit = process.env.FAKE_AGY_HANG_INIT;
+    process.env.FAKE_AGY_RPC_LOG = rpcLog;
+    process.env.FAKE_AGY_PROMPT_DELAY_MS = '1400';
+
+    try {
+      // 1. sendPrompt validates mode/model BEFORE locking busy or spawning child
+      const bridgeVal = new AcpBridge({ projectDir: dir, agyBin: FAKE_AGY, rpcTimeoutMs: 1200 });
+      await assert.rejects(
+        () => bridgeVal.sendPrompt({ text: 'Halo', mode: 'invalid-mode' }),
+        (err) => err?.status === 400
+      );
+      await assert.rejects(
+        () => bridgeVal.sendPrompt({ text: 'Halo', model: '   ' }),
+        (err) => err?.status === 400
+      );
+      assert.equal(bridgeVal.getStatus().busy, false);
+      assert.equal(bridgeVal.getStatus().connected, false);
+      assert.equal(bridgeVal.getStatus().sessionId, null);
+      assert.equal(bridgeVal.child, null);
+
+      // 2. createSession({ mode, model }) sends session/set_mode only ONCE + session/prompt ignores rpcTimeoutMs (250ms > 120ms)
+      const created = await bridgeVal.createSession({ mode: 'plan', model: 'gemini-2.5-pro' });
+      assert.equal(created.ok, true);
+      assert.equal(created.mode, 'plan');
+      assert.equal(created.model, 'gemini-2.5-pro');
+      const rpcs = fs.readFileSync(rpcLog, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+      const setModeCalls = rpcs.filter((r) => r.method === 'session/set_mode');
+      assert.equal(setModeCalls.length, 1);
+      assert.equal(setModeCalls[0].params.modeId, 'plan');
+
+      const slowPromptRes = await bridgeVal.sendPrompt('__TIMED_TURN__');
+      assert.equal(slowPromptRes.status, 202);
+      const turnOutcome = await bridgeVal.waitForTurn();
+      assert.equal(turnOutcome.ok, true);
+      assert.equal(turnOutcome.result.stopReason, 'end_turn');
+
+      // 3. Idempotent shutdown() 2x and post-shutdown calls fail cleanly with 503 without respawning
+      await bridgeVal.shutdown();
+      await bridgeVal.shutdown();
+      assert.equal(bridgeVal.child, null);
+      await assert.rejects(() => bridgeVal.createSession(), (err) => err?.status === 503);
+      await assert.rejects(() => bridgeVal.loadSession('cli-idle'), (err) => err?.status === 503);
+      await assert.rejects(() => bridgeVal.sendPrompt('halo'), (err) => err?.status === 503);
+      assert.equal(bridgeVal.child, null);
+
+      // 4. Control RPC timeout (rpcTimeoutMs: 120) when child hangs on initialize
+      process.env.FAKE_AGY_HANG_INIT = '1';
+      const bridgeHang = new AcpBridge({ projectDir: dir, agyBin: FAKE_AGY, rpcTimeoutMs: 120 });
+      await assert.rejects(() => bridgeHang.createSession(), /Batas waktu RPC ACP/);
+      assert.equal(bridgeHang.getStatus().connected, false);
+      assert.equal(bridgeHang.getStatus().busy, false);
+      assert.equal(bridgeHang.starting, false);
+      assert.equal(bridgeHang.child, null);
+      await bridgeHang.shutdown();
+      delete process.env.FAKE_AGY_HANG_INIT;
+
+      // 5. Windows .cmd wrapper execution via ComSpec (only on win32)
+      if (process.platform === 'win32') {
+        const cmdPath = path.join(dir, 'agy wrapper.cmd');
+        fs.writeFileSync(cmdPath, `@echo off\r\n"${process.execPath}" "${FAKE_AGY}" %*\r\n`, 'utf8');
+        const bridgeCmd = new AcpBridge({
+          projectDir: dir,
+          agyBin: cmdPath,
+          cfg: { chat: { sandbox: true } },
+        });
+        try {
+          const cmdSess = await bridgeCmd.createSession();
+          assert.equal(cmdSess.ok, true);
+          assert.equal(bridgeCmd._initResult?._meta?.sandbox, true);
+        } finally {
+          await bridgeCmd.shutdown();
+        }
+      }
+    } finally {
+      if (prevRpcLog === undefined) delete process.env.FAKE_AGY_RPC_LOG;
+      else process.env.FAKE_AGY_RPC_LOG = prevRpcLog;
+      if (prevDelay === undefined) delete process.env.FAKE_AGY_PROMPT_DELAY_MS;
+      else process.env.FAKE_AGY_PROMPT_DELAY_MS = prevDelay;
+      if (prevHangInit === undefined) delete process.env.FAKE_AGY_HANG_INIT;
+      else process.env.FAKE_AGY_HANG_INIT = prevHangInit;
       cleanDir(dir);
     }
   });
@@ -677,6 +786,15 @@ describe('serve.mjs + AcpBridge HTTP integration', () => {
       assert.equal(sendPerm.status, 202);
 
       const permReqEv = await liveSse.waitForEvent('permission_request');
+
+      // GET /kerja/api/state saat izin menggantung wajib memantulkan status ACP aktif
+      const stateBusy = await rawRequest(port, { reqPath: '/kerja/api/state', headers: { Host: `127.0.0.1:${port}` } });
+      assert.equal(stateBusy.status, 200);
+      assert.equal(stateBusy.json.chat.connected, true);
+      assert.equal(stateBusy.json.chat.busy, true);
+      assert.equal(stateBusy.json.chat.pending_permission_count, 1);
+      assert.equal(stateBusy.json.chat.session_id, 'cli-idle-1');
+
       const permRes = await rawRequest(port, {
         method: 'POST',
         reqPath: '/kerja/api/chat/permission',
@@ -685,6 +803,16 @@ describe('serve.mjs + AcpBridge HTTP integration', () => {
       });
       assert.equal(permRes.status, 200);
       await liveSse.waitForEvent('turn_done');
+
+      // Reload sesi aktif yang sedang terhubung dengan bridge ini tetap 200
+      const reloadSelf = await rawRequest(port, {
+        method: 'POST',
+        reqPath: '/kerja/api/chat/session',
+        headers: { Host: `127.0.0.1:${port}`, Origin: origin, Cookie: cookiePair, 'Content-Type': 'application/json' },
+        body: { sessionId: 'cli-idle-1' },
+      });
+      assert.equal(reloadSelf.status, 200);
+      assert.equal(reloadSelf.json.sessionId, 'cli-idle-1');
 
       // Slow turn + cancel via HTTP
       const sendSlow = await rawRequest(port, {
@@ -704,9 +832,20 @@ describe('serve.mjs + AcpBridge HTTP integration', () => {
       });
       assert.equal(cancelHttp.status, 200);
       await liveSse.waitForEvent('turn_cancelled');
+      await server.acpBridge.waitForTurn();
+
+      const spawnedChild = server.acpBridge.child;
+      assert.ok(spawnedChild);
+      liveSse.close();
+      liveSse = null;
+      await new Promise((resolve) => server.close(resolve));
+      assert.equal(server.acpBridge.getStatus().connected, false);
+      assert.ok(spawnedChild.exitCode !== null || spawnedChild.signalCode !== null || spawnedChild.killed);
     } finally {
       liveSse?.close();
-      await new Promise((resolve) => server.close(resolve));
+      if (server.listening) {
+        await new Promise((resolve) => server.close(resolve));
+      }
       if (prevAg === undefined) delete process.env.ANTIGRAVITY_HOME;
       else process.env.ANTIGRAVITY_HOME = prevAg;
       if (prevBin === undefined) delete process.env.KANTOR_AGY_BIN;

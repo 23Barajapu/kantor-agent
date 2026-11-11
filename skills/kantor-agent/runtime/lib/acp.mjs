@@ -1,9 +1,12 @@
 import { spawn } from 'node:child_process';
+import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
-import { isPlainObj, isoMs } from './util.mjs';
+import { isFile, isPlainObj, isoMs } from './util.mjs';
 
 const VALID_MODES = new Set(['plan', 'accept-edits', 'auto']);
 const MAX_HISTORY = 200;
+const MAX_STDOUT_LINE_BYTES = 4 * 1024 * 1024;
+const DEFAULT_RPC_TIMEOUT_MS = 30_000;
 const SSE_HEARTBEAT_MS = 20_000;
 const SHUTDOWN_KILL_WAIT_MS = 400;
 
@@ -33,6 +36,62 @@ function extractUpdateText(update) {
   return '';
 }
 
+function resolveWindowsBinary(agyBin) {
+  const raw = String(agyBin || '').trim();
+  const lower = raw.toLowerCase();
+  if (lower.endsWith('.mjs') || lower.endsWith('.js')) {
+    return { kind: 'node', bin: raw };
+  }
+  if (lower.endsWith('.exe') || lower.endsWith('.com')) {
+    return { kind: 'direct', bin: raw };
+  }
+  if (lower.endsWith('.cmd') || lower.endsWith('.bat')) {
+    return { kind: 'cmd', bin: raw };
+  }
+
+  const hasSep = raw.includes('\\') || raw.includes('/') || raw.includes(':');
+  const rawPathext = String(process.env.PATHEXT || '.EXE;.COM;.CMD;.BAT')
+    .split(';')
+    .map((e) => e.trim().toLowerCase())
+    .filter((e) => e === '.exe' || e === '.com' || e === '.cmd' || e === '.bat');
+  const exts = ['.exe', ...rawPathext.filter((e) => e !== '.exe')];
+
+  if (hasSep) {
+    if (isFile(raw)) {
+      return { kind: 'direct', bin: raw };
+    }
+    for (const ext of exts) {
+      const cand = `${raw}${ext}`;
+      if (isFile(cand)) {
+        return { kind: ext === '.cmd' || ext === '.bat' ? 'cmd' : 'direct', bin: cand };
+      }
+    }
+    return { kind: 'direct', bin: raw };
+  }
+
+  const pathDirs = String(process.env.PATH || '')
+    .split(path.delimiter)
+    .map((d) => d.trim().replace(/^"+|"+$/g, ''))
+    .filter(Boolean);
+
+  for (const ext of exts) {
+    for (const dir of pathDirs) {
+      const cand = path.join(dir, `${raw}${ext}`);
+      if (isFile(cand)) {
+        return { kind: ext === '.cmd' || ext === '.bat' ? 'cmd' : 'direct', bin: cand };
+      }
+    }
+  }
+  return { kind: 'direct', bin: raw };
+}
+
+function quoteCmdToken(token) {
+  if (/[\s"&|<>^()]/.test(token)) {
+    return `"${token}"`;
+  }
+  return token;
+}
+
 /**
  * Jembatan stdio JSON-RPC 2.0 untuk `agy acp --stdio` dengan lazy-start,
  * guard keamanan `session/load`, antrean giliran tunggal, streaming SSE,
@@ -46,6 +105,7 @@ export class AcpBridge {
     isSessionRunningOutsideAcp = () => false,
     isCliSession = null,
     permissionTimeoutMs = 120_000,
+    rpcTimeoutMs = DEFAULT_RPC_TIMEOUT_MS,
   } = {}) {
     this.projectDir =
       typeof projectDir === 'string' && projectDir.trim() !== '' ? projectDir : process.cwd();
@@ -69,6 +129,8 @@ export class AcpBridge {
       Number.isFinite(permissionTimeoutMs) && permissionTimeoutMs > 0
         ? permissionTimeoutMs
         : 120_000;
+    this.rpcTimeoutMs =
+      Number.isFinite(rpcTimeoutMs) && rpcTimeoutMs > 0 ? rpcTimeoutMs : DEFAULT_RPC_TIMEOUT_MS;
 
     this.connected = false;
     this.busy = false;
@@ -87,6 +149,7 @@ export class AcpBridge {
     this.child = null;
     this._stdoutDecoder = new StringDecoder('utf8');
     this._stdoutBuffer = '';
+    this._skipOversizedLine = false;
     this._nextRpcId = 1;
     this._nextHistId = 1;
     this._connectPromise = null;
@@ -118,6 +181,15 @@ export class AcpBridge {
 
   waitForTurn() {
     return this._turnPromise ?? Promise.resolve(null);
+  }
+
+  _validateConfigArgs({ mode, model } = {}) {
+    if (mode !== undefined && (typeof mode !== 'string' || !VALID_MODES.has(mode))) {
+      throw httpError(400, 'Mode chat harus salah satu dari plan, accept-edits, atau auto');
+    }
+    if (model !== undefined && model !== null && (typeof model !== 'string' || model.trim() === '')) {
+      throw httpError(400, 'Model harus berupa string non-kosong atau null');
+    }
   }
 
   _pushHistory(entry) {
@@ -251,15 +323,27 @@ export class AcpBridge {
     }
   }
 
-  _sendRequest(method, params = {}) {
+  _sendRpc(method, params = {}, timeoutMs = this.rpcTimeoutMs) {
     if (!this.child || !this.child.stdin || !this.child.stdin.writable || this.child.stdin.destroyed) {
       return Promise.reject(new Error('Proses ACP belum terhubung'));
     }
     const id = this._nextRpcId++;
     return new Promise((resolve, reject) => {
-      this.pendingRequests.set(id, { resolve, reject, method });
+      let timer = null;
+      if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+        timer = setTimeout(() => {
+          const pending = this.pendingRequests.get(id);
+          if (!pending) return;
+          this.pendingRequests.delete(id);
+          reject(new Error(`Batas waktu RPC ACP (${method}) terlampaui setelah ${timeoutMs}ms`));
+        }, timeoutMs);
+        timer.unref?.();
+      }
+
+      this.pendingRequests.set(id, { resolve, reject, method, timer });
       const written = this._writeRpc({ jsonrpc: '2.0', id, method, params });
       if (!written) {
+        if (timer) clearTimeout(timer);
         this.pendingRequests.delete(id);
         reject(new Error(`Gagal menulis permintaan ACP: ${method}`));
       }
@@ -268,13 +352,6 @@ export class AcpBridge {
 
   _sendNotification(method, params = {}) {
     return this._writeRpc({ jsonrpc: '2.0', method, params });
-  }
-
-  _rejectAllPendingRequests(err) {
-    for (const [id, pending] of Array.from(this.pendingRequests.entries())) {
-      this.pendingRequests.delete(id);
-      pending.reject(err);
-    }
   }
 
   _clearPendingPermissions({ writeCancel = false, eventName = 'permission_resolved', optionId = 'cancel' } = {}) {
@@ -299,6 +376,20 @@ export class AcpBridge {
     }
   }
 
+  _failAllPending(err, { writePermissionCancel = false, permissionEventName = null } = {}) {
+    this._clearPendingPermissions({
+      writeCancel: writePermissionCancel,
+      eventName: permissionEventName,
+      optionId: 'cancel',
+    });
+
+    for (const [id, pending] of Array.from(this.pendingRequests.entries())) {
+      if (pending.timer) clearTimeout(pending.timer);
+      this.pendingRequests.delete(id);
+      pending.reject(err);
+    }
+  }
+
   _handleStdoutLine(rawLine) {
     const line = rawLine.trim();
     if (!line || !line.startsWith('{')) return;
@@ -311,10 +402,10 @@ export class AcpBridge {
     }
     if (!isPlainObj(msg)) return;
 
-    // 1. JSON-RPC Response (id present, no method)
     if ('id' in msg && msg.id !== undefined && msg.id !== null && typeof msg.method !== 'string') {
       const pending = this.pendingRequests.get(msg.id);
       if (!pending) return;
+      if (pending.timer) clearTimeout(pending.timer);
       this.pendingRequests.delete(msg.id);
       if ('error' in msg && msg.error !== undefined && msg.error !== null) {
         const rpcErr = isPlainObj(msg.error) ? msg.error : { message: String(msg.error) };
@@ -328,7 +419,6 @@ export class AcpBridge {
       return;
     }
 
-    // 2. Server -> Client Request (id present + method present)
     if ('id' in msg && msg.id !== undefined && msg.id !== null && typeof msg.method === 'string') {
       if (msg.method === 'session/request_permission') {
         this._handlePermissionRequest(msg);
@@ -342,7 +432,6 @@ export class AcpBridge {
       return;
     }
 
-    // 3. Server -> Client Notification (no id + method present)
     if (!('id' in msg) && typeof msg.method === 'string') {
       if (msg.method === 'session/update') {
         this._handleSessionUpdate(msg.params);
@@ -474,76 +563,173 @@ export class AcpBridge {
     });
   }
 
-  _spawnChild() {
+  _resolveSpawnSpec() {
     const acpArgs = ['acp', '--stdio'];
     if (this.sandbox) acpArgs.push('--sandbox');
 
     const lowerBin = this.agyBin.toLowerCase();
-    const isNodeScript = lowerBin.endsWith('.mjs') || lowerBin.endsWith('.js');
-    const cmd = isNodeScript ? process.execPath : this.agyBin;
-    const args = isNodeScript ? [this.agyBin, ...acpArgs] : acpArgs;
+    if (lowerBin.endsWith('.mjs') || lowerBin.endsWith('.js')) {
+      return {
+        cmd: process.execPath,
+        args: [this.agyBin, ...acpArgs],
+        options: {
+          cwd: this.projectDir,
+          windowsHide: true,
+          shell: false,
+          stdio: ['pipe', 'pipe', 'pipe'],
+        },
+        viaCmd: false,
+      };
+    }
+
+    if (process.platform === 'win32') {
+      const resolved = resolveWindowsBinary(this.agyBin);
+      if (resolved.kind === 'node') {
+        return {
+          cmd: process.execPath,
+          args: [resolved.bin, ...acpArgs],
+          options: {
+            cwd: this.projectDir,
+            windowsHide: true,
+            shell: false,
+            stdio: ['pipe', 'pipe', 'pipe'],
+          },
+          viaCmd: false,
+        };
+      }
+      if (resolved.kind === 'cmd') {
+        if (/[\r\n\0"%!]/.test(resolved.bin)) {
+          throw new Error('Path biner ACP tidak valid untuk cmd.exe');
+        }
+        const comSpec = process.env.ComSpec || 'cmd.exe';
+        const cmdLine = `"${[quoteCmdToken(resolved.bin), ...acpArgs].join(' ')}"`;
+        return {
+          cmd: comSpec,
+          args: ['/d', '/s', '/c', cmdLine],
+          options: {
+            cwd: this.projectDir,
+            windowsHide: true,
+            windowsVerbatimArguments: true,
+            shell: false,
+            stdio: ['pipe', 'pipe', 'pipe'],
+          },
+          viaCmd: true,
+        };
+      }
+      return {
+        cmd: resolved.bin,
+        args: acpArgs,
+        options: {
+          cwd: this.projectDir,
+          windowsHide: true,
+          shell: false,
+          stdio: ['pipe', 'pipe', 'pipe'],
+        },
+        viaCmd: false,
+      };
+    }
+
+    return {
+      cmd: this.agyBin,
+      args: acpArgs,
+      options: {
+        cwd: this.projectDir,
+        windowsHide: true,
+        shell: false,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      },
+      viaCmd: false,
+    };
+  }
+
+  _handleChildExit(child, errMessage, isError) {
+    if (this.child === child) {
+      this.child = null;
+      this.connected = false;
+      this.busy = false;
+      this.sessionId = null;
+      this._initResult = null;
+    }
+
+    if (isError && errMessage && !this.shuttingDown) {
+      this.lastError = errMessage;
+    }
+
+    this._failAllPending(new Error(errMessage || 'Proses ACP terputus'), {
+      writePermissionCancel: false,
+      permissionEventName: this.shuttingDown ? null : 'permission_resolved',
+    });
+
+    if (!this.shuttingDown) {
+      if (isError && errMessage) {
+        this._broadcastSse('error', { error: errMessage });
+      }
+      this._broadcastSse('status', this.getStatus());
+    }
+  }
+
+  _spawnChild() {
+    const spec = this._resolveSpawnSpec();
 
     this._stdoutDecoder = new StringDecoder('utf8');
     this._stdoutBuffer = '';
+    this._skipOversizedLine = false;
     this._lastStderr = '';
 
-    const child = spawn(cmd, args, {
-      cwd: this.projectDir,
-      windowsHide: true,
-      shell: false,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
+    const child = spawn(spec.cmd, spec.args, spec.options);
+    child._viaCmd = spec.viaCmd;
     this.child = child;
 
     let disconnected = false;
     const onDisconnect = (errMessage, isError) => {
       if (disconnected) return;
       disconnected = true;
-
-      if (this.child === child) {
-        this.child = null;
-        this.connected = false;
-        this.busy = false;
-      }
-
-      if (isError && errMessage && !this.shuttingDown) {
-        this.lastError = errMessage;
-      }
-
-      this._clearPendingPermissions({
-        writeCancel: false,
-        eventName: this.shuttingDown ? null : 'permission_resolved',
-        optionId: 'cancel',
-      });
-      this._rejectAllPendingRequests(new Error(errMessage || 'Proses ACP terputus'));
-
-      if (!this.shuttingDown) {
-        if (isError && errMessage) {
-          this._broadcastSse('error', { error: errMessage });
-        }
-        this._broadcastSse('status', this.getStatus());
-      }
+      this._handleChildExit(child, errMessage, isError);
     };
 
     child.stdin?.on('error', () => {});
 
     child.stdout?.on('data', (chunk) => {
       if (this.child !== child) return;
-      this._stdoutBuffer += this._stdoutDecoder.write(chunk);
+      const text = this._stdoutDecoder.write(chunk);
+      if (!text) return;
+
+      if (this._skipOversizedLine) {
+        const nlPos = text.indexOf('\n');
+        if (nlPos === -1) return;
+        this._skipOversizedLine = false;
+        this._stdoutBuffer = text.slice(nlPos + 1);
+      } else {
+        this._stdoutBuffer += text;
+      }
+
       let nlIdx;
       while ((nlIdx = this._stdoutBuffer.indexOf('\n')) !== -1) {
         let line = this._stdoutBuffer.slice(0, nlIdx);
         this._stdoutBuffer = this._stdoutBuffer.slice(nlIdx + 1);
         if (line.endsWith('\r')) line = line.slice(0, -1);
+        if (Buffer.byteLength(line, 'utf8') > MAX_STDOUT_LINE_BYTES) {
+          this.lastError = 'Baris output ACP melebihi batas 4 MB';
+          this._broadcastSse('error', { error: this.lastError });
+          continue;
+        }
         this._handleStdoutLine(line);
+      }
+
+      if (Buffer.byteLength(this._stdoutBuffer, 'utf8') > MAX_STDOUT_LINE_BYTES) {
+        this._stdoutBuffer = '';
+        this._skipOversizedLine = true;
+        this.lastError = 'Baris output ACP melebihi batas 4 MB';
+        this._broadcastSse('error', { error: this.lastError });
       }
     });
 
     child.stdout?.on('end', () => {
       if (this.child !== child) return;
-      const tail = this._stdoutBuffer + this._stdoutDecoder.end();
+      const tail = (this._skipOversizedLine ? '' : this._stdoutBuffer) + this._stdoutDecoder.end();
       this._stdoutBuffer = '';
-      if (tail.trim()) {
+      this._skipOversizedLine = false;
+      if (tail.trim() && Buffer.byteLength(tail, 'utf8') <= MAX_STDOUT_LINE_BYTES) {
         this._handleStdoutLine(tail.replace(/\r$/, ''));
       }
     });
@@ -573,11 +759,15 @@ export class AcpBridge {
     if (!child) {
       this.connected = false;
       this.busy = false;
+      this.sessionId = null;
       return;
     }
 
     if (child.exitCode !== null || child.signalCode !== null) {
-      if (this.child === child) this.child = null;
+      if (this.child === child) {
+        this.child = null;
+        this.sessionId = null;
+      }
       this.connected = false;
       this.busy = false;
       return;
@@ -595,7 +785,10 @@ export class AcpBridge {
         clearTimeout(hardTimer);
         child.off('exit', finish);
         child.off('close', finish);
-        if (this.child === child) this.child = null;
+        if (this.child === child) {
+          this.child = null;
+          this.sessionId = null;
+        }
         this.connected = false;
         this.busy = false;
         resolve();
@@ -617,6 +810,13 @@ export class AcpBridge {
       killTimer = setTimeout(() => {
         try {
           if (child.exitCode === null && child.signalCode === null) {
+            if (process.platform === 'win32' && child._viaCmd && Number.isInteger(child.pid)) {
+              const killer = spawn('taskkill', ['/T', '/F', '/PID', String(child.pid)], {
+                windowsHide: true,
+                stdio: 'ignore',
+              });
+              killer.unref();
+            }
             child.kill('SIGKILL');
           }
         } catch {}
@@ -643,7 +843,7 @@ export class AcpBridge {
     this._connectPromise = (async () => {
       try {
         this._spawnChild();
-        const initRes = await this._sendRequest('initialize', {
+        const initRes = await this._sendRpc('initialize', {
           protocolVersion: 1,
           clientCapabilities: {
             fs: { readTextFile: false, writeTextFile: false },
@@ -671,7 +871,7 @@ export class AcpBridge {
 
   async _applySessionMode(sessionId, mode) {
     try {
-      await this._sendRequest('session/set_mode', { sessionId, modeId: mode });
+      await this._sendRpc('session/set_mode', { sessionId, modeId: mode });
     } catch (err) {
       if (!isMethodNotFoundError(err)) throw err;
     }
@@ -680,15 +880,19 @@ export class AcpBridge {
   async _applySessionModel(sessionId, model) {
     if (model === null) return;
     try {
-      await this._sendRequest('session/set_model', { sessionId, modelId: model });
+      await this._sendRpc('session/set_model', { sessionId, modelId: model });
     } catch (err) {
       if (!isMethodNotFoundError(err)) throw err;
     }
   }
 
-  async _createSessionInternal() {
+  async _createSessionInternal({ mode, model } = {}) {
+    this._validateConfigArgs({ mode, model });
+    const targetMode = mode !== undefined ? mode : this.mode;
+    const targetModel = model !== undefined ? (model === null ? null : model.trim()) : this.model;
+
     await this.ensureConnected();
-    const res = await this._sendRequest('session/new', {
+    const res = await this._sendRpc('session/new', {
       cwd: this.projectDir,
       mcpServers: [],
     });
@@ -698,6 +902,8 @@ export class AcpBridge {
     }
 
     this.sessionId = newSessionId;
+    this.mode = targetMode;
+    this.model = targetModel;
     await this._applySessionMode(this.sessionId, this.mode);
     if (this.model !== null) {
       await this._applySessionModel(this.sessionId, this.model);
@@ -726,14 +932,16 @@ export class AcpBridge {
     };
   }
 
-  async createSession() {
+  async createSession(opts = {}) {
+    const { mode, model } = isPlainObj(opts) ? opts : {};
+    this._validateConfigArgs({ mode, model });
     if (this.shuttingDown) {
       throw httpError(503, 'Jembatan ACP sedang dimatikan');
     }
     if (this.busy || this.starting) {
       throw httpError(409, 'Ketua sedang memproses giliran aktif');
     }
-    return this._createSessionInternal();
+    return this._createSessionInternal({ mode, model });
   }
 
   async loadSession(id) {
@@ -745,13 +953,6 @@ export class AcpBridge {
       throw httpError(400, 'ID sesi tidak valid');
     }
 
-    if (await this.isSessionRunningOutsideAcp(sessionId)) {
-      throw httpError(409, 'Sesi sedang berjalan di luar ACP');
-    }
-    if (this.isCliSession && !(await this.isCliSession(sessionId))) {
-      throw httpError(409, 'Hanya sesi root CLI/ACP proyek yang dapat dimuat');
-    }
-
     if (this.shuttingDown) {
       throw httpError(503, 'Jembatan ACP sedang dimatikan');
     }
@@ -759,8 +960,30 @@ export class AcpBridge {
       throw httpError(409, 'Ketua sedang memproses giliran aktif');
     }
 
+    if (
+      sessionId === this.sessionId &&
+      this.connected &&
+      this.child &&
+      this.child.exitCode === null &&
+      this.child.signalCode === null
+    ) {
+      return {
+        ok: true,
+        sessionId: this.sessionId,
+        mode: this.mode,
+        model: this.model,
+      };
+    }
+
+    if (await this.isSessionRunningOutsideAcp(sessionId)) {
+      throw httpError(409, 'Sesi sedang berjalan di luar ACP');
+    }
+    if (this.isCliSession && !(await this.isCliSession(sessionId))) {
+      throw httpError(409, 'Hanya sesi root CLI/ACP proyek yang dapat dimuat');
+    }
+
     await this.ensureConnected();
-    await this._sendRequest('session/load', {
+    await this._sendRpc('session/load', {
       sessionId,
       cwd: this.projectDir,
       mcpServers: [],
@@ -791,16 +1014,7 @@ export class AcpBridge {
   }
 
   async setConfig({ mode, model } = {}) {
-    if (mode !== undefined) {
-      if (typeof mode !== 'string' || !VALID_MODES.has(mode)) {
-        throw httpError(400, 'Mode chat harus salah satu dari plan, accept-edits, atau auto');
-      }
-    }
-    if (model !== undefined) {
-      if (model !== null && (typeof model !== 'string' || model.trim() === '')) {
-        throw httpError(400, 'Model harus berupa string non-kosong atau null');
-      }
-    }
+    this._validateConfigArgs({ mode, model });
 
     if (mode !== undefined) {
       this.mode = mode;
@@ -842,12 +1056,7 @@ export class AcpBridge {
     if (typeof rawText !== 'string' || rawText.trim() === '') {
       throw httpError(400, 'Teks prompt wajib diisi');
     }
-    if (mode !== undefined && (typeof mode !== 'string' || !VALID_MODES.has(mode))) {
-      throw httpError(400, 'Mode chat harus salah satu dari plan, accept-edits, atau auto');
-    }
-    if (model !== undefined && model !== null && (typeof model !== 'string' || model.trim() === '')) {
-      throw httpError(400, 'Model harus berupa string non-kosong atau null');
-    }
+    this._validateConfigArgs({ mode, model });
 
     if (this.shuttingDown) {
       throw httpError(503, 'Jembatan ACP sedang dimatikan');
@@ -862,9 +1071,7 @@ export class AcpBridge {
 
     try {
       if (!this.sessionId) {
-        if (mode !== undefined) this.mode = mode;
-        if (model !== undefined) this.model = model === null ? null : model.trim();
-        await this._createSessionInternal();
+        await this._createSessionInternal({ mode, model });
       } else {
         await this.ensureConnected();
         if (mode !== undefined || model !== undefined) {
@@ -882,10 +1089,14 @@ export class AcpBridge {
       this._broadcastSse('message', userMsg);
       this._broadcastSse('status', this.getStatus());
 
-      const rpcPromise = this._sendRequest('session/prompt', {
-        sessionId: activeSessionId,
-        prompt: [{ type: 'text', text }],
-      });
+      const rpcPromise = this._sendRpc(
+        'session/prompt',
+        {
+          sessionId: activeSessionId,
+          prompt: [{ type: 'text', text }],
+        },
+        null
+      );
 
       this._turnPromise = rpcPromise.then(
         (result) => {
@@ -1020,16 +1231,19 @@ export class AcpBridge {
       return { ok: true, status: this.getStatus(), history: this.getHistory() };
     }
 
+    this._validateConfigArgs({ mode: params.mode, model: params.model });
+
     const hasSessionId =
       params.sessionId !== undefined && params.sessionId !== null && String(params.sessionId).trim() !== '';
 
     if (hasSessionId) {
       await this.loadSession(String(params.sessionId));
+      if (params.mode !== undefined || params.model !== undefined) {
+        await this.setConfig({ mode: params.mode, model: params.model });
+      }
     } else if (params.action === 'new' || !this.sessionId) {
-      await this.createSession();
-    }
-
-    if (params.mode !== undefined || params.model !== undefined) {
+      await this.createSession({ mode: params.mode, model: params.model });
+    } else if (params.mode !== undefined || params.model !== undefined) {
       await this.setConfig({ mode: params.mode, model: params.model });
     }
 
@@ -1056,16 +1270,14 @@ export class AcpBridge {
     this._shutdownPromise = (async () => {
       this.shuttingDown = true;
 
-      this._clearPendingPermissions({
-        writeCancel: true,
-        eventName: null,
-      });
-
       if (this.busy && this.sessionId && this.child?.stdin?.writable && !this.child.stdin.destroyed) {
         this._sendNotification('session/cancel', { sessionId: this.sessionId });
       }
 
-      this._rejectAllPendingRequests(new Error('Jembatan ACP dimatikan'));
+      this._failAllPending(new Error('Jembatan ACP dimatikan'), {
+        writePermissionCancel: true,
+        permissionEventName: null,
+      });
 
       for (const client of Array.from(this.sseClients)) {
         this._cleanupSseClient(client);
@@ -1077,6 +1289,7 @@ export class AcpBridge {
       }
 
       await this._terminateChild();
+      this._initResult = null;
       this._turnPromise = null;
     })();
 

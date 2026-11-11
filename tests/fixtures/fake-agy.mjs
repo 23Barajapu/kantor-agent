@@ -82,6 +82,46 @@ function handlePrompt(msg) {
     return;
   }
 
+  if (text.includes('__OVERSIZED_STDOUT__')) {
+    process.stdout.write('x'.repeat(4 * 1024 * 1024 + 128) + '\n');
+    send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: 'Pulih setelah baris >4MB' },
+        },
+      },
+    });
+    send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+    return;
+  }
+
+  if (text.includes('__TIMED_TURN__')) {
+    const delayMs = Number(process.env.FAKE_AGY_PROMPT_DELAY_MS) || 250;
+    const timer = setTimeout(() => {
+      if (activeTurn && activeTurn.rpcId === msg.id) {
+        activeTurn = null;
+        send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: 'Giliran panjang selesai' },
+            },
+          },
+        });
+        send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+      }
+    }, delayMs);
+    activeTurn = { rpcId: msg.id, sessionId, timer };
+    return;
+  }
+
   if (text.includes('__SLOW_TURN__')) {
     send({
       jsonrpc: '2.0',
@@ -231,6 +271,15 @@ function handlePrompt(msg) {
 
 function handleMessage(msg) {
   if (!msg || typeof msg !== 'object') return;
+  if (process.env.FAKE_AGY_RPC_LOG && typeof msg.method === 'string') {
+    try {
+      fs.appendFileSync(
+        process.env.FAKE_AGY_RPC_LOG,
+        JSON.stringify({ method: msg.method, params: msg.params ?? null }) + '\n',
+        'utf8'
+      );
+    } catch {}
+  }
 
   // Response to server -> client request (e.g. session/request_permission)
   if ('id' in msg && !msg.method) {
@@ -255,6 +304,9 @@ function handleMessage(msg) {
     const params = msg.params && typeof msg.params === 'object' ? msg.params : {};
     switch (msg.method) {
       case 'initialize': {
+        if (process.env.FAKE_AGY_HANG_INIT === '1') {
+          return;
+        }
         send({
           jsonrpc: '2.0',
           id: msg.id,
@@ -268,6 +320,9 @@ function handleMessage(msg) {
         return;
       }
       case 'session/new': {
+        if (process.env.FAKE_AGY_HANG_NEW === '1') {
+          return;
+        }
         sessionSeq += 1;
         const sessionId = `cli-sess-new-${sessionSeq}`;
         sessions.set(sessionId, { cwd: params.cwd || '', mode: 'accept-edits', model: null });

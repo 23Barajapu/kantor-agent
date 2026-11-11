@@ -367,11 +367,16 @@ function mergeResumesAndStops(baseSegs, resumeTimes, stopTimes, cooldownSec) {
   return segs;
 }
 
-function isCliSessionRow(row) {
-  if (row.nesting_depth !== 0) return false;
-  if (row.source === 'CORTEX_TRAJECTORY_SOURCE_CLI') return true;
-  const dbRootClean = String(row.dbRoot || '').replace(/[\\/]+$/, '').toLowerCase();
-  return dbRootClean.endsWith('antigravity-cli') && row.app_data_dir !== 'antigravity';
+export function isCliMain(row) {
+  if (!row || row.nesting_depth !== 0 || row.parent_conversation_id) return false;
+  if (row.app_data_dir === 'antigravity-cli') return true;
+  const sourceUpper = String(row.source || '').toUpperCase();
+  if (sourceUpper === 'CORTEX_TRAJECTORY_SOURCE_CLI' || sourceUpper.includes('CLI')) return true;
+  const dbRootClean = String(row.dbRoot || '')
+    .replace(/[\\/]+$/, '')
+    .replaceAll('\\', '/')
+    .toLowerCase();
+  return path.posix.basename(dbRootClean) === 'antigravity-cli' && row.app_data_dir !== 'antigravity';
 }
 
 function readBytesAt(fd, position, length) {
@@ -914,7 +919,7 @@ export class TranscriptScanner {
       };
       mains.push(mainEntry);
 
-      if (isCliSessionRow(row)) {
+      if (isCliMain(row)) {
         cliSessions.push({
           id: row.conversation_id,
           title,
