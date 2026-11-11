@@ -13,6 +13,7 @@ const CMD_UNSAFE_RE = /[\x00-\x1f\x7f"&|<>^%!;=]/;
 const MAX_HISTORY = 200;
 const MAX_STDOUT_LINE_BYTES = 4 * 1024 * 1024;
 const DEFAULT_RPC_TIMEOUT_MS = 30_000;
+const DEFAULT_MODELS_TIMEOUT_MS = 120_000;
 const SSE_HEARTBEAT_MS = 20_000;
 const SHUTDOWN_KILL_WAIT_MS = 400;
 const MAX_PARSED_MODELS = 200;
@@ -24,6 +25,17 @@ function isAllowedCommandTuple(args) {
   return ALLOWED_STATIC_COMMAND_TUPLES.some((tuple) =>
     tuple.length === args.length && tuple.every((val, idx) => val === args[idx])
   );
+}
+
+function pushNormalizedModel(models, seenIds, rawId, rawName) {
+  const id = typeof rawId === 'string' ? rawId.trim() : '';
+  const name = typeof rawName === 'string' && rawName.trim() !== '' ? rawName.trim() : id;
+  if (!id || id.length > MAX_MODEL_ID_LEN || name.length > MAX_MODEL_NAME_LEN || seenIds.has(id)) {
+    return false;
+  }
+  seenIds.add(id);
+  models.push({ id, name });
+  return models.length >= MAX_PARSED_MODELS;
 }
 
 export function parseModelsOutput(stdout) {
@@ -39,20 +51,7 @@ export function parseModelsOutput(stdout) {
     if (tabIdx === -1) {
       continue;
     }
-    const rawId = rawLine.slice(0, tabIdx).trim();
-    let rawName = rawLine.slice(tabIdx + 1).trim();
-    if (!rawName) {
-      rawName = rawId;
-    }
-    if (!rawId || rawId.length > MAX_MODEL_ID_LEN || rawName.length > MAX_MODEL_NAME_LEN) {
-      continue;
-    }
-    if (seenIds.has(rawId)) {
-      continue;
-    }
-    seenIds.add(rawId);
-    models.push({ id: rawId, name: rawName });
-    if (models.length >= MAX_PARSED_MODELS) {
+    if (pushNormalizedModel(models, seenIds, rawLine.slice(0, tabIdx), rawLine.slice(tabIdx + 1))) {
       break;
     }
   }
@@ -190,9 +189,7 @@ export class AcpBridge {
     isCliSession = null,
     permissionTimeoutMs = 120_000,
     rpcTimeoutMs = DEFAULT_RPC_TIMEOUT_MS,
-    modelsTimeoutMs = Number(process.env.KANTOR_MODELS_TIMEOUT_MS) > 0
-      ? Number(process.env.KANTOR_MODELS_TIMEOUT_MS)
-      : 60_000,
+    modelsTimeoutMs = null,
     modelsCacheTtlMs = 300_000,
   } = {}) {
     this.projectDir =
@@ -219,12 +216,13 @@ export class AcpBridge {
         : 120_000;
     this.rpcTimeoutMs =
       Number.isFinite(rpcTimeoutMs) && rpcTimeoutMs > 0 ? rpcTimeoutMs : DEFAULT_RPC_TIMEOUT_MS;
+    const envModelsTimeout = Number(process.env.KANTOR_MODELS_TIMEOUT_MS);
     this.modelsTimeoutMs =
       Number.isFinite(modelsTimeoutMs) && modelsTimeoutMs > 0
         ? modelsTimeoutMs
-        : Number(process.env.KANTOR_MODELS_TIMEOUT_MS) > 0
-          ? Number(process.env.KANTOR_MODELS_TIMEOUT_MS)
-          : 60_000;
+        : Number.isFinite(envModelsTimeout) && envModelsTimeout > 0
+          ? envModelsTimeout
+          : DEFAULT_MODELS_TIMEOUT_MS;
     this.modelsCacheTtlMs =
       Number.isFinite(modelsCacheTtlMs) && modelsCacheTtlMs > 0 ? modelsCacheTtlMs : 300_000;
     this._modelsCache = null;
@@ -1094,6 +1092,29 @@ export class AcpBridge {
     }
   }
 
+  _ingestSessionModels(res) {
+    const rawList = Array.isArray(res?.models?.availableModels)
+      ? res.models.availableModels
+      : null;
+    if (!rawList || rawList.length === 0) return;
+
+    const parsed = [];
+    const seenIds = new Set();
+    for (const entry of rawList) {
+      const id = entry?.modelId ?? entry?.id;
+      if (pushNormalizedModel(parsed, seenIds, id, entry?.name)) {
+        break;
+      }
+    }
+
+    if (parsed.length > 0) {
+      this._modelsCache = {
+        models: parsed,
+        fetchedAt: Date.now(),
+      };
+    }
+  }
+
   async _createSessionInternal({ mode, model } = {}) {
     this._validateConfigArgs({ mode, model });
     const targetMode = mode !== undefined ? mode : this.mode;
@@ -1108,6 +1129,8 @@ export class AcpBridge {
     if (!newSessionId) {
       throw new Error('ACP session/new tidak mengembalikan sessionId');
     }
+
+    this._ingestSessionModels(res);
 
     await this._applySessionMode(newSessionId, targetMode);
     if (targetModel !== null) {
@@ -1202,11 +1225,12 @@ export class AcpBridge {
       }
 
       await this.ensureConnected();
-      await this._sendRpc('session/load', {
+      const loadRes = await this._sendRpc('session/load', {
         sessionId,
         cwd: this.projectDir,
         mcpServers: [],
       });
+      this._ingestSessionModels(loadRes);
 
       await this._applySessionMode(sessionId, this.mode);
       if (this.model !== null) {

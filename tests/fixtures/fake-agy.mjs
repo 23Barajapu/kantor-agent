@@ -409,7 +409,13 @@ function handleMessage(msg) {
           sessionSeq += 1;
           const sessionId = `cli-sess-new-${sessionSeq}`;
           sessions.set(sessionId, { cwd: params.cwd || '', mode: 'accept-edits', model: null });
-          send({ jsonrpc: '2.0', id: msg.id, result: { sessionId } });
+          const result = { sessionId };
+          if (process.env.FAKE_AGY_SESSION_MODELS) {
+            try {
+              result.models = { availableModels: JSON.parse(process.env.FAKE_AGY_SESSION_MODELS) };
+            } catch {}
+          }
+          send({ jsonrpc: '2.0', id: msg.id, result });
         };
         const delayNew = Number(process.env.FAKE_AGY_SLOW_NEW_MS);
         if (Number.isFinite(delayNew) && delayNew > 0) {

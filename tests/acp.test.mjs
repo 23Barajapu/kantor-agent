@@ -1492,5 +1492,50 @@ describe('Dynamic Model Discovery & Cache (listModels & parseModelsOutput)', () 
         }
       });
     }
+
+    it('defaults modelsTimeoutMs to 120000 and ingests availableModels returned by ACP session/new', async () => {
+      const dir = makeTempDir('kantor-acp-session-models-');
+      const prevTimeout = process.env.KANTOR_MODELS_TIMEOUT_MS;
+      const prevSessModels = process.env.FAKE_AGY_SESSION_MODELS;
+      const prevLog = process.env.FAKE_AGY_LOG_FILE;
+      delete process.env.KANTOR_MODELS_TIMEOUT_MS;
+
+      const logFile = path.join(dir, 'spawn.log');
+      process.env.FAKE_AGY_LOG_FILE = logFile;
+      process.env.FAKE_AGY_SESSION_MODELS = JSON.stringify([
+        { modelId: 'gemini-3.8-flash-high', name: 'Gemini 3.8 Flash (High)' },
+        { modelId: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)' },
+      ]);
+
+      const bridge = new AcpBridge({
+        projectDir: dir,
+        agyBin: FAKE_AGY,
+      });
+
+      try {
+        assert.equal(bridge.modelsTimeoutMs, 120_000);
+        await bridge.createSession();
+        const spawnsAfterSession = fs.readFileSync(logFile, 'utf8').trim().split('\n').length;
+        const listed = await bridge.listModels();
+        assert.equal(listed.ok, true);
+        assert.equal(listed.cached, true);
+        assert.equal(listed.source, 'cache');
+        assert.deepEqual(listed.models, [
+          { id: 'gemini-3.8-flash-high', name: 'Gemini 3.8 Flash (High)' },
+          { id: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)' },
+        ]);
+        const spawnsAfterList = fs.readFileSync(logFile, 'utf8').trim().split('\n').length;
+        assert.equal(spawnsAfterList, spawnsAfterSession, 'listModels() should hit session-seeded cache without spawning agy models');
+      } finally {
+        await bridge.shutdown();
+        if (prevTimeout === undefined) delete process.env.KANTOR_MODELS_TIMEOUT_MS;
+        else process.env.KANTOR_MODELS_TIMEOUT_MS = prevTimeout;
+        if (prevSessModels === undefined) delete process.env.FAKE_AGY_SESSION_MODELS;
+        else process.env.FAKE_AGY_SESSION_MODELS = prevSessModels;
+        if (prevLog === undefined) delete process.env.FAKE_AGY_LOG_FILE;
+        else process.env.FAKE_AGY_LOG_FILE = prevLog;
+        cleanDir(dir);
+      }
+    });
   });
 });

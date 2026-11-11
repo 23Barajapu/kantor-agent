@@ -714,5 +714,6 @@ if (isMainModule()) {
     const displayHost = addr && typeof addr === 'object' ? addr.address : bind;
     const displayPort = addr && typeof addr === 'object' ? addr.port : port;
     process.stdout.write(`kantor-agent listening on http://${displayHost}:${displayPort}/kerja\n`);
+    server.acpBridge?.listModels?.().catch(() => {});
   });
 }

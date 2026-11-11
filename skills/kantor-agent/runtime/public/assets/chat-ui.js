@@ -627,6 +627,8 @@ export function createChatDrawer({ $, cfg, ketuaName, ago, clip: clipFn }) {
         }
         if (data?.degraded && data?.error && modelsList.length === 0) {
           setNotice(data.error, 'info');
+        } else if (!data?.degraded && modelsList.length > 0 && noticeEl.classList.contains('info')) {
+          setNotice('');
         }
       }
     } catch {
@@ -683,12 +685,12 @@ export function createChatDrawer({ $, cfg, ketuaName, ago, clip: clipFn }) {
       modeSelect.value = status.mode;
     }
 
-    if (status.model && Array.isArray(modelsList) && modelsList.some((m) => m && m.id === status.model)) {
+    if (modelSelect && modelSelect.value === '__custom__') {
+      // Pertahankan customMode saat pengguna sedang mengisi input model custom
+    } else if (status.model && Array.isArray(modelsList) && modelsList.some((m) => m && m.id === status.model)) {
       customMode = false;
     } else if (!status.model) {
-      if (modelSelect && modelSelect.value !== '__custom__') {
-        customMode = false;
-      }
+      customMode = false;
     }
 
     const resolved = resolveModelSelectionState(status.model, modelsList, modelsFetched, customMode);
@@ -906,6 +908,9 @@ export function createChatDrawer({ $, cfg, ketuaName, ago, clip: clipFn }) {
       renderSessionOptions();
       renderMessages();
       renderStatus();
+      if (modelsList.length === 0) {
+        loadModels();
+      }
     });
 
     stream.addEventListener('message', (ev) => {
