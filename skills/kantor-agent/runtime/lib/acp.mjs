@@ -670,20 +670,23 @@ export class AcpBridge {
     });
   }
 
-  _resolveSpawnSpec() {
-    const acpArgs = ['acp', '--stdio'];
-    if (this.sandbox) acpArgs.push('--sandbox');
+  _resolveSpawnSpec(customArgs = null, { stdio = ['pipe', 'pipe', 'pipe'] } = {}) {
+    let targetArgs = customArgs;
+    if (!targetArgs) {
+      targetArgs = ['acp', '--stdio'];
+      if (this.sandbox) targetArgs.push('--sandbox');
+    }
 
     const lowerBin = this.agyBin.toLowerCase();
     if (lowerBin.endsWith('.mjs') || lowerBin.endsWith('.js')) {
       return {
         cmd: process.execPath,
-        args: [this.agyBin, ...acpArgs],
+        args: [this.agyBin, ...targetArgs],
         options: {
           cwd: this.projectDir,
           windowsHide: true,
           shell: false,
-          stdio: ['pipe', 'pipe', 'pipe'],
+          stdio,
         },
         isCmd: false,
       };
@@ -694,18 +697,18 @@ export class AcpBridge {
       if (resolved.kind === 'node') {
         return {
           cmd: process.execPath,
-          args: [resolved.bin, ...acpArgs],
+          args: [resolved.bin, ...targetArgs],
           options: {
             cwd: this.projectDir,
             windowsHide: true,
             shell: false,
-            stdio: ['pipe', 'pipe', 'pipe'],
+            stdio,
           },
           isCmd: false,
         };
       }
       if (resolved.kind === 'cmd') {
-        const wrapped = wrapWindowsCmd(resolved.bin, acpArgs);
+        const wrapped = wrapWindowsCmd(resolved.bin, targetArgs);
         return {
           cmd: wrapped.cmd,
           args: wrapped.args,
@@ -714,19 +717,19 @@ export class AcpBridge {
             windowsHide: true,
             windowsVerbatimArguments: true,
             shell: false,
-            stdio: ['pipe', 'pipe', 'pipe'],
+            stdio,
           },
           isCmd: true,
         };
       }
       return {
         cmd: resolved.bin,
-        args: acpArgs,
+        args: targetArgs,
         options: {
           cwd: this.projectDir,
           windowsHide: true,
           shell: false,
-          stdio: ['pipe', 'pipe', 'pipe'],
+          stdio,
         },
         isCmd: false,
       };
@@ -734,12 +737,12 @@ export class AcpBridge {
 
     return {
       cmd: this.agyBin,
-      args: acpArgs,
+      args: targetArgs,
       options: {
         cwd: this.projectDir,
         windowsHide: true,
         shell: false,
-        stdio: ['pipe', 'pipe', 'pipe'],
+        stdio,
       },
       isCmd: false,
     };
@@ -1578,76 +1581,7 @@ export class AcpBridge {
   }
 
   _resolveModelsSpawnSpec() {
-    const modelsArgs = ['models'];
-    const lowerBin = this.agyBin.toLowerCase();
-    if (lowerBin.endsWith('.mjs') || lowerBin.endsWith('.js')) {
-      return {
-        cmd: process.execPath,
-        args: [this.agyBin, ...modelsArgs],
-        options: {
-          cwd: this.projectDir,
-          windowsHide: true,
-          shell: false,
-          stdio: ['ignore', 'pipe', 'pipe'],
-        },
-        isCmd: false,
-      };
-    }
-
-    if (process.platform === 'win32') {
-      const resolved = resolveWindowsBinary(this.agyBin);
-      if (resolved.kind === 'node') {
-        return {
-          cmd: process.execPath,
-          args: [resolved.bin, ...modelsArgs],
-          options: {
-            cwd: this.projectDir,
-            windowsHide: true,
-            shell: false,
-            stdio: ['ignore', 'pipe', 'pipe'],
-          },
-          isCmd: false,
-        };
-      }
-      if (resolved.kind === 'cmd') {
-        const wrapped = wrapWindowsCmd(resolved.bin, modelsArgs);
-        return {
-          cmd: wrapped.cmd,
-          args: wrapped.args,
-          options: {
-            cwd: this.projectDir,
-            windowsHide: true,
-            windowsVerbatimArguments: true,
-            shell: false,
-            stdio: ['ignore', 'pipe', 'pipe'],
-          },
-          isCmd: true,
-        };
-      }
-      return {
-        cmd: resolved.bin,
-        args: modelsArgs,
-        options: {
-          cwd: this.projectDir,
-          windowsHide: true,
-          shell: false,
-          stdio: ['ignore', 'pipe', 'pipe'],
-        },
-        isCmd: false,
-      };
-    }
-
-    return {
-      cmd: this.agyBin,
-      args: modelsArgs,
-      options: {
-        cwd: this.projectDir,
-        windowsHide: true,
-        shell: false,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      },
-      isCmd: false,
-    };
+    return this._resolveSpawnSpec(['models'], { stdio: ['ignore', 'pipe', 'pipe'] });
   }
 
   _sanitizeModelsError(err, exitCode = null, signal = null) {
@@ -1666,30 +1600,33 @@ export class AcpBridge {
     return 'Daftar model kosong dari agy models';
   }
 
+  _createModelsFailureResult(safeError) {
+    if (this._modelsCache && Array.isArray(this._modelsCache.models) && this._modelsCache.models.length > 0) {
+      return {
+        ok: true,
+        models: this._modelsCache.models.map((m) => ({ ...m })),
+        source: 'cache-stale',
+        cached: true,
+        degraded: true,
+        error: safeError,
+      };
+    }
+    return {
+      ok: false,
+      models: [],
+      source: 'error',
+      cached: false,
+      degraded: true,
+      error: safeError,
+    };
+  }
+
   async _fetchModels() {
     let spec;
     try {
       spec = this._resolveModelsSpawnSpec();
     } catch {
-      const safeError = 'Konfigurasi biner agy models tidak valid';
-      if (this._modelsCache && Array.isArray(this._modelsCache.models) && this._modelsCache.models.length > 0) {
-        return {
-          ok: true,
-          models: [...this._modelsCache.models],
-          source: 'cache-stale',
-          cached: true,
-          degraded: true,
-          error: safeError,
-        };
-      }
-      return {
-        ok: false,
-        models: [],
-        source: 'error',
-        cached: false,
-        degraded: true,
-        error: safeError,
-      };
+      return this._createModelsFailureResult('Konfigurasi biner agy models tidak valid');
     }
 
     const MAX_STDOUT_BYTES = 512 * 1024;
@@ -1699,26 +1636,7 @@ export class AcpBridge {
       try {
         child = spawn(spec.cmd, spec.args, spec.options);
       } catch (spawnErr) {
-        const safeError = this._sanitizeModelsError(spawnErr);
-        if (this._modelsCache && Array.isArray(this._modelsCache.models) && this._modelsCache.models.length > 0) {
-          resolve({
-            ok: true,
-            models: [...this._modelsCache.models],
-            source: 'cache-stale',
-            cached: true,
-            degraded: true,
-            error: safeError,
-          });
-        } else {
-          resolve({
-            ok: false,
-            models: [],
-            source: 'error',
-            cached: false,
-            degraded: true,
-            error: safeError,
-          });
-        }
+        resolve(this._createModelsFailureResult(this._sanitizeModelsError(spawnErr)));
         return;
       }
 
@@ -1778,12 +1696,12 @@ export class AcpBridge {
           const models = parseModelsOutput(stdoutBuffer);
           if (models.length > 0) {
             this._modelsCache = {
-              models,
+              models: models.map((m) => ({ ...m })),
               fetchedAt: Date.now(),
             };
             resolve({
               ok: true,
-              models,
+              models: models.map((m) => ({ ...m })),
               source: 'agy-models',
               cached: false,
               degraded: false,
@@ -1794,25 +1712,7 @@ export class AcpBridge {
           safeError = 'Daftar model kosong dari agy models';
         }
 
-        if (this._modelsCache && Array.isArray(this._modelsCache.models) && this._modelsCache.models.length > 0) {
-          resolve({
-            ok: true,
-            models: [...this._modelsCache.models],
-            source: 'cache-stale',
-            cached: true,
-            degraded: true,
-            error: safeError,
-          });
-        } else {
-          resolve({
-            ok: false,
-            models: [],
-            source: 'error',
-            cached: false,
-            degraded: true,
-            error: safeError,
-          });
-        }
+        resolve(this._createModelsFailureResult(safeError));
       };
 
       child.on('error', (err) => {
@@ -1829,7 +1729,7 @@ export class AcpBridge {
     if (!force && this._modelsCache && (Date.now() - this._modelsCache.fetchedAt) < this.modelsCacheTtlMs) {
       return {
         ok: true,
-        models: [...this._modelsCache.models],
+        models: this._modelsCache.models.map((m) => ({ ...m })),
         source: 'cache',
         cached: true,
         degraded: false,

@@ -1321,6 +1321,11 @@ describe('Dynamic Model Discovery & Cache (listModels & parseModelsOutput)', () 
         assert.equal(cached.error, null);
         assert.deepEqual(cached.models, r1.models);
 
+        // Mutating caller copy must not mutate internal cache or subsequent caller copies
+        r1.models[0].name = 'MUTATED_BY_CALLER';
+        const freshRead = await bridge.listModels();
+        assert.notEqual(freshRead.models[0].name, 'MUTATED_BY_CALLER');
+
         const spawnLogs2 = fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean);
         assert.equal(spawnLogs2.length, 1, 'Cache hit must not spawn new process');
 
