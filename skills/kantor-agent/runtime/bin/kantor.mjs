@@ -16,7 +16,9 @@ import { isDir, isFile, normalizeWorkspacePath, readText } from '../lib/util.mjs
 const execFileAsync = promisify(execFile);
 
 const RUNTIME_DIR = path.resolve(import.meta.dirname, '..');
-const DEFAULT_AGENTS_RESOURCES_DIR = path.resolve(RUNTIME_DIR, '..', 'resources', 'agents');
+const SKILL_ROOT = path.resolve(RUNTIME_DIR, '..');
+const PLUGIN_ROOT = path.resolve(RUNTIME_DIR, '..', '..', '..');
+const DEFAULT_AGENTS_RESOURCES_DIR = path.resolve(SKILL_ROOT, 'resources', 'agents');
 const SERVE_SCRIPT = path.join(RUNTIME_DIR, 'bin', 'serve.mjs');
 const CMD_UNSAFE_RE = /[\x00-\x1f\x7f"&|<>^%!;=]/;
 const EXPECTED_AGENT_FILES = [
@@ -182,7 +184,7 @@ export function parseLauncherArgs(argv = []) {
   return out;
 }
 
-function connectHostForBind(bind) {
+export function connectHostForBind(bind) {
   const b = String(bind || '127.0.0.1').trim();
   if (b === '' || b === '0.0.0.0') return '127.0.0.1';
   if (b === '::' || b === '[::]') return '::1';
@@ -194,6 +196,11 @@ function formatHostForUrl(host) {
   const h = String(host || '127.0.0.1');
   if (h.includes(':') && !h.startsWith('[')) return `[${h}]`;
   return h;
+}
+
+export function buildTunnelTargetUrl(meta) {
+  const rawHost = connectHostForBind(meta?.bind || meta?.connectHost || '127.0.0.1');
+  return `http://${formatHostForUrl(rawHost)}:${meta?.port}`;
 }
 
 function isLoopbackBind(bind) {
@@ -407,6 +414,7 @@ async function getBinaryVersion(binPath) {
       const comSpec = process.env.ComSpec || 'cmd.exe';
       const { stdout } = await execFileAsync(comSpec, ['/d', '/s', '/c', `""${binPath}" --version"`], {
         windowsHide: true,
+        windowsVerbatimArguments: true,
         timeout: 5000,
       });
       return stdout.trim().split(/\r?\n/)[0] || null;
@@ -458,7 +466,11 @@ async function handleDetect(args) {
       : 'agy';
   const agyPath = await locateBinary('agy', agyRequested);
   const agyVersion = agyPath ? await getBinaryVersion(agyPath) : null;
-  const cfPath = await locateBinary('cloudflared');
+  const cfRequested =
+    typeof process.env.KANTOR_CLOUDFLARED_BIN === 'string' && process.env.KANTOR_CLOUDFLARED_BIN.trim() !== ''
+      ? process.env.KANTOR_CLOUDFLARED_BIN.trim()
+      : 'cloudflared';
+  const cfPath = await locateBinary('cloudflared', cfRequested);
 
   const roots = discoverSurfaceRoots(os.homedir());
   const surfaceRoots = roots.map((r) => ({
@@ -538,16 +550,35 @@ async function handleSetupTeam(args) {
   return 0;
 }
 
-function printStartSummary({ header, url, bind, token, projectDir }) {
-  const selfScript = path.join(RUNTIME_DIR, 'bin', 'kantor.mjs');
-  const lines = [header, `URL: ${url}`];
-  if (!isLoopbackBind(bind)) {
-    lines.push(`Token: ${token}`);
-    lines.push('Peringatan: bind non-loopback aktif; simpan chat-token dengan aman.');
-  } else {
-    lines.push(`Token: jalankan 'node "${selfScript}" token --project "${projectDir}"' (otomatis di localhost)`);
+function detectStartFlagMismatches(args, existing) {
+  const diffs = [];
+  if (typeof args.bind === 'string' && args.bind.trim() !== '' && args.bind.trim() !== existing.bind) {
+    diffs.push(`--bind=${args.bind.trim()} (aktif: ${existing.bind ?? '127.0.0.1'})`);
   }
-  lines.push(`Stop: node "${selfScript}" stop --project "${projectDir}"`);
+  if (typeof args.sandbox === 'boolean' && args.sandbox !== Boolean(existing.sandbox)) {
+    diffs.push(`--sandbox=${args.sandbox} (aktif: ${Boolean(existing.sandbox)})`);
+  }
+  if (Number.isInteger(args.port) && Number.isInteger(existing.port) && args.port !== existing.port) {
+    diffs.push(`--port=${args.port} (aktif: ${existing.port})`);
+  }
+  return diffs;
+}
+
+function printStartSummary({ header, url, bind, storageDir, projectDir, mismatchNote = '' }) {
+  const selfScript = path.join(RUNTIME_DIR, 'bin', 'kantor.mjs');
+  const tokenFile = path.join(storageDir, 'chat-token');
+  const lines = [header, `URL       : ${url}`];
+  if (mismatchNote) {
+    lines.push(`Catatan   : ${mismatchNote}`);
+  }
+  lines.push(`File token: ${tokenFile}`);
+  if (!isLoopbackBind(bind)) {
+    lines.push(`Token cmd : node "${selfScript}" token --project "${projectDir}"`);
+    lines.push('Keamanan  : bind non-loopback aktif; jalankan perintah token secara terpisah agar secret tidak tercetak ke transkrip.');
+  } else {
+    lines.push(`Token cmd : node "${selfScript}" token --project "${projectDir}" (otomatis di localhost)`);
+  }
+  lines.push(`Stop      : node "${selfScript}" stop --project "${projectDir}"`);
   process.stdout.write(`${lines.join('\n')}\n`);
 }
 
@@ -569,19 +600,40 @@ async function handleStart(args) {
     const existingHost = existing.connectHost || connectHostForBind(existing.bind || bind);
     const ping = await probePing(existingHost, existing.port);
     if (ping) {
-      const authManager = createAuthManager(storageDir);
-      const token = authManager.getToken();
+      createAuthManager(storageDir);
+      const tokenFile = path.join(storageDir, 'chat-token');
       const existingUrl = existing.url || `http://${formatHostForUrl(existingHost)}:${existing.port}/kerja`;
       const effectiveBind = existing.bind || bind;
+      const diffs = detectStartFlagMismatches(args, existing);
+      const mismatchNote = diffs.length
+        ? `Opsi baru berbeda dari server aktif [${diffs.join(', ')}]. Jalankan 'restart' untuk menerapkan.`
+        : '';
       if (args.json) {
-        process.stdout.write(`${JSON.stringify({ ok: true, alreadyRunning: true, ...existing, url: existingUrl }, null, 2)}\n`);
+        if (mismatchNote) {
+          process.stderr.write(`Peringatan: ${mismatchNote}\n`);
+        }
+        process.stdout.write(
+          `${JSON.stringify(
+            {
+              ok: true,
+              alreadyRunning: true,
+              ...existing,
+              url: existingUrl,
+              tokenFile,
+              ...(mismatchNote ? { warning: mismatchNote } : {}),
+            },
+            null,
+            2
+          )}\n`
+        );
       } else if (!args.quiet) {
         printStartSummary({
           header: 'Kantor Agent sudah berjalan.',
           url: existingUrl,
           bind: effectiveBind,
-          token,
+          storageDir,
           projectDir,
+          mismatchNote,
         });
       }
       return 0;
@@ -590,8 +642,8 @@ async function handleStart(args) {
 
   removeFileSafe(serverJsonPath);
   fs.mkdirSync(storageDir, { recursive: true, mode: 0o700 });
-  const authManager = createAuthManager(storageDir);
-  const token = authManager.getToken();
+  createAuthManager(storageDir);
+  const tokenFile = path.join(storageDir, 'chat-token');
 
   const port = await findAvailablePort(basePort, bind, 20);
   const connectHost = connectHostForBind(bind);
@@ -615,6 +667,7 @@ async function handleStart(args) {
   let child;
   let childExited = false;
   let exitInfo = '';
+  let spawnErr = null;
   try {
     child = spawn(process.execPath, childArgs, {
       cwd: projectDir,
@@ -627,10 +680,13 @@ async function handleStart(args) {
       exitInfo = `code=${code ?? 'null'} signal=${signal ?? 'null'}`;
     });
     child.once('error', (err) => {
+      spawnErr = err;
       childExited = true;
       exitInfo = err.message;
     });
     child.unref();
+  } catch (err) {
+    throw new Error(`Gagal menjalankan server Kantor Agent: ${err?.message || String(err)}`);
   } finally {
     fs.closeSync(logFd);
   }
@@ -638,10 +694,11 @@ async function handleStart(args) {
   const deadline = Date.now() + 8000;
   let ready = false;
   while (Date.now() < deadline) {
-    if (childExited) {
+    if (spawnErr || childExited || child.exitCode !== null) {
       const tail = readLogTail(logPath, 20);
+      const detail = spawnErr ? spawnErr.message : exitInfo || `code=${child.exitCode}`;
       throw new Error(
-        `Server gagal start (${exitInfo}).${tail ? `\nLog terakhir (${logPath}):\n${tail}` : ''}`
+        `Server gagal start (${detail}).${tail ? `\nLog terakhir (${logPath}):\n${tail}` : ''}`
       );
     }
     const ping = await probePing(connectHost, port, 800);
@@ -674,13 +731,13 @@ async function handleStart(args) {
   writePrivateFile(serverJsonPath, `${JSON.stringify(meta, null, 2)}\n`);
 
   if (args.json) {
-    process.stdout.write(`${JSON.stringify({ ok: true, ...meta }, null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify({ ok: true, ...meta, tokenFile }, null, 2)}\n`);
   } else if (!args.quiet) {
     printStartSummary({
       header: 'Kantor Agent aktif!',
       url: localUrl,
       bind,
-      token,
+      storageDir,
       projectDir,
     });
   }
@@ -823,6 +880,52 @@ function handleToken(args) {
   return 0;
 }
 
+function printTunnelSummary({ header, url, storageDir, projectDir }) {
+  const selfScript = path.join(RUNTIME_DIR, 'bin', 'kantor.mjs');
+  const tokenFile = path.join(storageDir, 'chat-token');
+  process.stdout.write(
+    [
+      header,
+      `URL Publik : ${url}`,
+      `File token : ${tokenFile}`,
+      `Token cmd  : node "${selfScript}" token --project "${projectDir}"`,
+      'Keamanan   : Autentikasi chat & eksekusi Ketua wajib memakai chat-token. Jangan salin nilai token ke percakapan/log publik.',
+    ].join('\n') + '\n'
+  );
+}
+
+function spawnCloudflaredDetached(cfPath, targetUrl, projectDir, logFd) {
+  const lower = cfPath.toLowerCase();
+  if (lower.endsWith('.mjs') || lower.endsWith('.js')) {
+    return spawn(process.execPath, [cfPath, 'tunnel', '--url', targetUrl], {
+      cwd: projectDir,
+      detached: true,
+      windowsHide: true,
+      stdio: ['ignore', logFd, logFd],
+    });
+  }
+  if (process.platform === 'win32' && (lower.endsWith('.cmd') || lower.endsWith('.bat'))) {
+    if (CMD_UNSAFE_RE.test(cfPath) || CMD_UNSAFE_RE.test(targetUrl)) {
+      throw new Error('Path cloudflared atau URL target mengandung karakter tidak aman untuk cmd.exe');
+    }
+    const comSpec = process.env.ComSpec || 'cmd.exe';
+    const cmdLine = `""${cfPath}" tunnel --url ${targetUrl}"`;
+    return spawn(comSpec, ['/d', '/s', '/c', cmdLine], {
+      cwd: projectDir,
+      detached: true,
+      windowsHide: true,
+      windowsVerbatimArguments: true,
+      stdio: ['ignore', logFd, logFd],
+    });
+  }
+  return spawn(cfPath, ['tunnel', '--url', targetUrl], {
+    cwd: projectDir,
+    detached: true,
+    windowsHide: true,
+    stdio: ['ignore', logFd, logFd],
+  });
+}
+
 async function handleTunnel(args) {
   const projectDir = path.resolve(args.project || process.cwd());
   const storageDir = resolveStorageDir(args, projectDir);
@@ -832,28 +935,39 @@ async function handleTunnel(args) {
     return 1;
   }
 
-  const connectHost = meta.connectHost || connectHostForBind(meta.bind || '127.0.0.1');
+  const connectHost = connectHostForBind(meta.bind || meta.connectHost || '127.0.0.1');
+  const targetUrl = buildTunnelTargetUrl(meta);
   const ping = await probePing(connectHost, meta.port);
   if (!ping) {
     process.stderr.write(`Server pada port ${meta.port} tidak merespons. Jalankan "restart" terlebih dahulu.\n`);
     return 1;
   }
 
+  createAuthManager(storageDir);
+  const tokenFile = path.join(storageDir, 'chat-token');
   const tunnelJsonPath = path.join(storageDir, 'tunnel.json');
   const tunnelUrlPath = path.join(storageDir, 'tunnel-url.txt');
   const existingTunnel = readJsonFile(tunnelJsonPath);
   const existingUrl = (readText(tunnelUrlPath) || '').trim();
   if (existingTunnel?.pid && processAlive(existingTunnel.pid) && existingUrl) {
-    const token = createAuthManager(storageDir).getToken();
     if (args.json) {
-      process.stdout.write(`${JSON.stringify({ ok: true, alreadyRunning: true, url: existingUrl, token }, null, 2)}\n`);
+      process.stdout.write(`${JSON.stringify({ ok: true, alreadyRunning: true, url: existingUrl, tokenFile }, null, 2)}\n`);
     } else if (!args.quiet) {
-      process.stdout.write(`Tunnel sudah aktif: ${existingUrl}\nToken chat: ${token}\nPeringatan: jangan bagikan URL + token ini ke pihak tidak tepercaya.\n`);
+      printTunnelSummary({
+        header: 'Tunnel sudah aktif!',
+        url: existingUrl,
+        storageDir,
+        projectDir,
+      });
     }
     return 0;
   }
 
-  const cfPath = await locateBinary('cloudflared');
+  const cfRequested =
+    typeof process.env.KANTOR_CLOUDFLARED_BIN === 'string' && process.env.KANTOR_CLOUDFLARED_BIN.trim() !== ''
+      ? process.env.KANTOR_CLOUDFLARED_BIN.trim()
+      : 'cloudflared';
+  const cfPath = await locateBinary('cloudflared', cfRequested);
   if (!cfPath) {
     const installHint =
       process.platform === 'win32'
@@ -865,6 +979,8 @@ async function handleTunnel(args) {
     return 1;
   }
 
+  removeFileSafe(tunnelJsonPath);
+  removeFileSafe(tunnelUrlPath);
   const tunnelLogPath = path.join(storageDir, 'tunnel.log');
   writePrivateFile(tunnelLogPath, '');
   const logFd = fs.openSync(tunnelLogPath, 'a', 0o600);
@@ -872,73 +988,80 @@ async function handleTunnel(args) {
   let child;
   let childExited = false;
   let exitInfo = '';
+  let spawnErr = null;
   try {
-    child = spawn(cfPath, ['tunnel', '--url', `http://${connectHost}:${meta.port}`], {
-      cwd: projectDir,
-      detached: true,
-      windowsHide: true,
-      stdio: ['ignore', logFd, logFd],
-    });
+    child = spawnCloudflaredDetached(cfPath, targetUrl, projectDir, logFd);
     child.once('exit', (code, signal) => {
       childExited = true;
       exitInfo = `code=${code ?? 'null'} signal=${signal ?? 'null'}`;
     });
     child.once('error', (err) => {
+      spawnErr = err;
       childExited = true;
       exitInfo = err.message;
     });
     child.unref();
+  } catch (err) {
+    removeFileSafe(tunnelJsonPath);
+    removeFileSafe(tunnelUrlPath);
+    throw new Error(`Gagal menjalankan cloudflared: ${err?.message || String(err)}`);
   } finally {
     fs.closeSync(logFd);
   }
 
-  const deadline = Date.now() + 12_000;
-  let foundBase = '';
-  while (Date.now() < deadline) {
-    const logText = readText(tunnelLogPath) || '';
-    const m = TRY_CLOUDFLARE_RE.exec(logText);
-    if (m) {
-      foundBase = m[0].toLowerCase().replace(/\/+$/, '');
-      break;
+  try {
+    const deadline = Date.now() + 12_000;
+    let foundBase = '';
+    while (Date.now() < deadline) {
+      const logText = readText(tunnelLogPath) || '';
+      const m = TRY_CLOUDFLARE_RE.exec(logText);
+      if (m) {
+        foundBase = m[0].toLowerCase().replace(/\/+$/, '');
+        break;
+      }
+      if (spawnErr || childExited || child.exitCode !== null) {
+        const tail = readLogTail(tunnelLogPath, 20);
+        const detail = spawnErr ? spawnErr.message : exitInfo || `code=${child.exitCode}`;
+        throw new Error(
+          `cloudflared berhenti sebelum menghasilkan URL (${detail}).${tail ? `\nLog:\n${tail}` : ''}`
+        );
+      }
+      await sleep(200);
     }
-    if (childExited) {
+
+    if (!foundBase) {
       const tail = readLogTail(tunnelLogPath, 20);
       throw new Error(
-        `cloudflared berhenti sebelum menghasilkan URL (${exitInfo}).${tail ? `\nLog:\n${tail}` : ''}`
+        `Gagal mendapatkan URL trycloudflare.com dalam 12 detik.${tail ? `\nLog:\n${tail}` : ''}`
       );
     }
-    await sleep(200);
-  }
 
-  if (!foundBase) {
-    await terminatePid(child.pid, 300);
-    const tail = readLogTail(tunnelLogPath, 20);
-    throw new Error(
-      `Gagal mendapatkan URL trycloudflare.com dalam 12 detik.${tail ? `\nLog:\n${tail}` : ''}`
+    const publicUrl = `${foundBase}/kerja`;
+    writePrivateFile(tunnelUrlPath, `${publicUrl}\n`);
+    writePrivateFile(
+      tunnelJsonPath,
+      `${JSON.stringify({ pid: child.pid, url: publicUrl, localPort: meta.port, startedAt: new Date().toISOString() }, null, 2)}\n`
     );
-  }
 
-  const publicUrl = `${foundBase}/kerja`;
-  writePrivateFile(tunnelUrlPath, `${publicUrl}\n`);
-  writePrivateFile(
-    tunnelJsonPath,
-    `${JSON.stringify({ pid: child.pid, url: publicUrl, localPort: meta.port, startedAt: new Date().toISOString() }, null, 2)}\n`
-  );
-
-  const token = createAuthManager(storageDir).getToken();
-  if (args.json) {
-    process.stdout.write(`${JSON.stringify({ ok: true, pid: child.pid, url: publicUrl, token }, null, 2)}\n`);
-  } else if (!args.quiet) {
-    process.stdout.write(
-      [
-        `Tunnel publik aktif!`,
-        `URL Publik : ${publicUrl}`,
-        `Token Chat : ${token}`,
-        'Keamanan   : Autentikasi chat & eksekusi Ketua wajib memakai chat-token di atas. Jangan bagikan tautan/token secara publik.',
-      ].join('\n') + '\n'
-    );
+    if (args.json) {
+      process.stdout.write(`${JSON.stringify({ ok: true, pid: child.pid, url: publicUrl, tokenFile }, null, 2)}\n`);
+    } else if (!args.quiet) {
+      printTunnelSummary({
+        header: 'Tunnel publik aktif!',
+        url: publicUrl,
+        storageDir,
+        projectDir,
+      });
+    }
+    return 0;
+  } catch (err) {
+    if (child?.pid && processAlive(child.pid)) {
+      await terminatePid(child.pid, 300);
+    }
+    removeFileSafe(tunnelJsonPath);
+    removeFileSafe(tunnelUrlPath);
+    throw err;
   }
-  return 0;
 }
 
 async function handleTunnelStop(args) {
@@ -955,14 +1078,35 @@ async function handleTunnelStop(args) {
   return 0;
 }
 
+export function resolveAutostartProject(args = {}, cwd = process.cwd()) {
+  const rawExplicit =
+    (typeof args?.project === 'string' && args.project.trim()) ||
+    (typeof process.env.ANTIGRAVITY_PROJECT_DIR === 'string' && process.env.ANTIGRAVITY_PROJECT_DIR.trim()) ||
+    (typeof process.env.PROJECT_DIR === 'string' && process.env.PROJECT_DIR.trim()) ||
+    (typeof process.env.WORKSPACE_FOLDER === 'string' && process.env.WORKSPACE_FOLDER.trim()) ||
+    '';
+
+  if (rawExplicit) {
+    return { skip: false, projectDir: path.resolve(rawExplicit) };
+  }
+
+  const normCwd = normalizeWorkspacePath(path.resolve(cwd));
+  const normPluginRoot = normalizeWorkspacePath(PLUGIN_ROOT);
+  const normSkillRoot = normalizeWorkspacePath(SKILL_ROOT);
+  if (normCwd && (normCwd === normPluginRoot || normCwd === normSkillRoot)) {
+    return { skip: true, reason: 'plugin-root' };
+  }
+
+  return { skip: false, projectDir: path.resolve(cwd) };
+}
+
 async function handleAutostart(args) {
   try {
-    const projectDir = path.resolve(
-      args.project ||
-        process.env.ANTIGRAVITY_PROJECT_DIR ||
-        process.env.PROJECT_DIR ||
-        process.cwd()
-    );
+    const resolved = resolveAutostartProject(args, process.cwd());
+    if (resolved.skip) {
+      return 0;
+    }
+    const projectDir = resolved.projectDir;
     const cfg = loadConfig(RUNTIME_DIR, projectDir);
     const envOn =
       process.env.KANTOR_AUTOSTART === '1' ||

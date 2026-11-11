@@ -70,10 +70,15 @@ Buka URL yang dicetak di browser (default `http://127.0.0.1:8788/kerja`). Tekan 
 | `status [--json]` | Menampilkan status server, PID, port, subagent aktif, dan `public_url`. |
 | `url` | Mencetak URL lokal (atau `public_url` bila tunnel aktif). |
 | `token` | Mencetak `chat-token` rahasia dari `<storageDir>/chat-token`. |
-| `tunnel` / `tunnel-stop` | Membuka / menutup tunnel publik sementara via `cloudflared`. |
-| `autostart` | Hook `SessionStart` opt-in (hanya menyala bila `autostart: true` atau `KANTOR_AUTOSTART=1`). |
+| `tunnel` / `tunnel-stop` | Membuka / menutup tunnel publik sementara via `cloudflared` (hanya mencetak path file `chat-token`, bukan nilai mentahnya). |
+| `autostart` | Hook `SessionStart` opt-in (hanya menyala bila `autostart: true` atau `KANTOR_AUTOSTART=1`, dan aman dilewati bila dijalankan dari root folder plugin tanpa `--project`/env). |
 
 Flag yang didukung: `--project <dir>`, `--storage <dir>`, `--bind <ip>`, `--port <n>`, `--sandbox`, `--force`, `--quiet`, `--json`.
+
+### Autentikasi Chat Non-Loopback & Akses CLI
+
+- **Browser (LAN / Tunnel):** Masukkan nilai dari `<storageDir>/chat-token` di formulir laci **Chat Ketua** (`POST /kerja/api/chat/auth`) untuk mendapatkan cookie sesi `HttpOnly; SameSite=Strict`.
+- **Akses CLI / Skrip Non-Browser:** Kirim header `Authorization: Bearer <token>` (atau `X-Kantor-Token: <token>`) langsung pada endpoint `/kerja/api/chat/*`, atau gunakan sesi cookie yang diperoleh dari `POST /kerja/api/chat/auth`. Nilai `<token>` diambil secara terpisah melalui `node skills/kantor-agent/runtime/bin/kantor.mjs token` atau file `<storageDir>/chat-token`.
 
 ---
 

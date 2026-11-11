@@ -83,4 +83,5 @@ Opsional, letakkan di root proyek untuk menimpa bawaan `defaults.json`:
 
 - Default server hanya mengikat **`127.0.0.1`**; akses loopback lokal otomatis terotentikasi.
 - Untuk akses **LAN (`--bind 0.0.0.0`)** atau **tunnel publik (`tunnel`)**, autentikasi chat ACP mewajibkan **`chat-token`** (`timingSafeEqual` + cookie `HttpOnly; SameSite=Strict` + validasi `Host` & `Origin`). **Jangan bagikan atau commit `chat-token`**.
+- **Aturan kerahasiaan token bagi agen:** Saat menjalankan `start` atau `tunnel`, **jangan menjalankan `kantor.mjs token` dan jangan membaca/menyalin nilai `chat-token` ke percakapan** kecuali diminta secara eksplisit oleh pengguna. Arahkan pengguna mengambil token langsung lewat perintah `node "${SKILL_DIR}/runtime/bin/kantor.mjs" token` atau membaca file `chat-token` di direktori storage yang tercetak.
 - Di browser, tekan **`C`** untuk membuka laci **Chat Ketua** (pilih sesi CLI/ACP, mode `accept-edits`/`plan`/`auto`, model, kartu izin interaktif 120 detik), tekan **`H`** untuk tampilan kantor penuh, dan klik tab **Artifact** untuk pratinjau teredaksi.

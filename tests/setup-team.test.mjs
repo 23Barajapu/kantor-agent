@@ -535,4 +535,231 @@ describe('Task 9: rules/AGENTS.md, IT specialist templates, setupTeam, and CLI l
       cleanDir(tmpRoot);
     }
   });
+
+  it('redacts chat-token on non-loopback start, warns on sandbox flag mismatch, and returns token via token subcommand', async () => {
+    const tmpRoot = makeTempDir('kantor-nonloopback-');
+    const projectDir = path.join(tmpRoot, 'proj');
+    const storageDir = path.join(tmpRoot, 'storage');
+    const agyHome = path.join(tmpRoot, 'agy-home');
+    fs.mkdirSync(projectDir, { recursive: true });
+    fs.mkdirSync(storageDir, { recursive: true });
+    fs.mkdirSync(agyHome, { recursive: true });
+
+    const port = await findFreePort('127.0.0.1');
+    const env = { KANTOR_STORAGE: storageDir, ANTIGRAVITY_HOME: agyHome };
+
+    try {
+      // 1. Start with --bind 0.0.0.0
+      const start1 = await runKantorCli(
+        ['start', '--project', projectDir, '--storage', storageDir, '--bind', '0.0.0.0', '--port', String(port)],
+        env
+      );
+      const tokenPath = path.join(storageDir, 'chat-token');
+      assert.ok(fs.existsSync(tokenPath), 'chat-token file must be created');
+      const rawToken = fs.readFileSync(tokenPath, 'utf8').trim();
+      assert.match(rawToken, /^[a-f0-9]{64}$/);
+
+      // Must NOT print raw token or ?token= to stdout
+      assert.equal(start1.stdout.includes(rawToken), false, 'start stdout must not print raw chat-token');
+      assert.equal(start1.stdout.includes('?token='), false, 'start stdout must not print ?token=');
+      assert.ok(start1.stdout.includes(tokenPath), 'start stdout must print chat-token file path');
+      assert.match(start1.stdout, /\btoken\b/);
+
+      const meta1 = JSON.parse(fs.readFileSync(path.join(storageDir, 'server.json'), 'utf8'));
+      assert.equal(meta1.bind, '0.0.0.0');
+      assert.equal(meta1.sandbox, false);
+
+      // 2. Idempotent start with mismatched --sandbox flag keeps PID and prints restart warning without leaking token
+      const start2 = await runKantorCli(
+        ['start', '--project', projectDir, '--storage', storageDir, '--bind', '0.0.0.0', '--sandbox', '--port', String(port)],
+        env
+      );
+      const meta2 = JSON.parse(fs.readFileSync(path.join(storageDir, 'server.json'), 'utf8'));
+      assert.equal(meta2.pid, meta1.pid, 'idempotent start must preserve PID');
+      assert.equal(start2.stdout.includes(rawToken), false, 'idempotent start stdout must not print raw chat-token');
+      assert.equal(start2.stdout.includes('?token='), false, 'idempotent start stdout must not print ?token=');
+      assert.match(start2.stdout, /--sandbox=true/);
+      assert.match(start2.stdout, /restart/i);
+
+      // 3. Dedicated `token` command still prints the exact 64-hex token
+      const tokenRes = await runKantorCli(
+        ['token', '--project', projectDir, '--storage', storageDir],
+        env
+      );
+      assert.equal(tokenRes.stdout.trim(), rawToken);
+    } finally {
+      try {
+        await runKantorCli(['stop', '--project', projectDir, '--storage', storageDir], env);
+      } catch {}
+      try {
+        const meta = JSON.parse(fs.readFileSync(path.join(storageDir, 'server.json'), 'utf8'));
+        killPidBestEffort(meta?.pid);
+      } catch {}
+      cleanDir(tmpRoot);
+    }
+  });
+
+  it('autostart exits 0 quietly when disabled or when CWD is plugin root without explicit project', async () => {
+    const mod = await import('../skills/kantor-agent/runtime/bin/kantor.mjs');
+    const skillRoot = path.resolve(WORKTREE_ROOT, 'skills', 'kantor-agent');
+
+    // Unit test resolveAutostartProject precedence and plugin-root guard
+    const prevAgy = process.env.ANTIGRAVITY_PROJECT_DIR;
+    const prevProj = process.env.PROJECT_DIR;
+    const prevWs = process.env.WORKSPACE_FOLDER;
+    try {
+      delete process.env.ANTIGRAVITY_PROJECT_DIR;
+      delete process.env.PROJECT_DIR;
+      delete process.env.WORKSPACE_FOLDER;
+      assert.deepEqual(mod.resolveAutostartProject({}, WORKTREE_ROOT), { skip: true, reason: 'plugin-root' });
+      assert.deepEqual(mod.resolveAutostartProject({}, skillRoot), { skip: true, reason: 'plugin-root' });
+
+      process.env.WORKSPACE_FOLDER = os.tmpdir();
+      const wsRes = mod.resolveAutostartProject({}, WORKTREE_ROOT);
+      assert.equal(wsRes.skip, false);
+      assert.equal(wsRes.projectDir, path.resolve(os.tmpdir()));
+
+      process.env.PROJECT_DIR = path.join(os.tmpdir(), 'pdir');
+      assert.equal(mod.resolveAutostartProject({}, WORKTREE_ROOT).projectDir, path.resolve(os.tmpdir(), 'pdir'));
+
+      process.env.ANTIGRAVITY_PROJECT_DIR = path.join(os.tmpdir(), 'agyproj');
+      assert.equal(mod.resolveAutostartProject({}, WORKTREE_ROOT).projectDir, path.resolve(os.tmpdir(), 'agyproj'));
+    } finally {
+      if (prevAgy === undefined) delete process.env.ANTIGRAVITY_PROJECT_DIR;
+      else process.env.ANTIGRAVITY_PROJECT_DIR = prevAgy;
+      if (prevProj === undefined) delete process.env.PROJECT_DIR;
+      else process.env.PROJECT_DIR = prevProj;
+      if (prevWs === undefined) delete process.env.WORKSPACE_FOLDER;
+      else process.env.WORKSPACE_FOLDER = prevWs;
+    }
+
+    // CLI test: autostart from plugin root (WORKTREE_ROOT) with KANTOR_AUTOSTART=1 and no --project/env skips cleanly!
+    const tmpRoot = makeTempDir('kantor-autostart-');
+    const storageDir = path.join(tmpRoot, 'storage');
+    const projDir = path.join(tmpRoot, 'proj');
+    fs.mkdirSync(projDir, { recursive: true });
+    try {
+      const pluginRootRes = await runKantorCli(
+        ['autostart', '--storage', storageDir],
+        {
+          KANTOR_AUTOSTART: '1',
+          KANTOR_STORAGE: storageDir,
+          ANTIGRAVITY_PROJECT_DIR: '',
+          PROJECT_DIR: '',
+          WORKSPACE_FOLDER: '',
+        },
+        WORKTREE_ROOT
+      );
+      assert.equal(pluginRootRes.stdout.trim(), '');
+      assert.equal(fs.existsSync(storageDir), false, 'autostart in plugin root must not create storage or spawn server');
+
+      // Also verify autostart: false in a regular project directory exits 0 quietly without spawning
+      const disabledRes = await runKantorCli(
+        ['autostart', '--project', projDir, '--storage', storageDir],
+        { KANTOR_AUTOSTART: '' }
+      );
+      assert.equal(disabledRes.stdout.trim(), '');
+      assert.equal(fs.existsSync(path.join(storageDir, 'server.json')), false);
+    } finally {
+      cleanDir(tmpRoot);
+    }
+  });
+
+  it('connectHostForBind & buildTunnelTargetUrl support IPv4/wildcard/IPv6, and tunnel redacts token & cleans up fast on early exit', async () => {
+    const mod = await import('../skills/kantor-agent/runtime/bin/kantor.mjs');
+    assert.equal(mod.connectHostForBind('0.0.0.0'), '127.0.0.1');
+    assert.equal(mod.connectHostForBind('::'), '::1');
+    assert.equal(mod.connectHostForBind('[::]'), '::1');
+    assert.equal(mod.connectHostForBind('192.168.1.10'), '192.168.1.10');
+    assert.equal(mod.buildTunnelTargetUrl({ bind: '0.0.0.0', port: 8788 }), 'http://127.0.0.1:8788');
+    assert.equal(mod.buildTunnelTargetUrl({ bind: '::', port: 8788 }), 'http://[::1]:8788');
+    assert.equal(mod.buildTunnelTargetUrl({ bind: '::1', port: 8790 }), 'http://[::1]:8790');
+    assert.equal(mod.buildTunnelTargetUrl({ bind: '10.0.0.5', port: 8791 }), 'http://10.0.0.5:8791');
+
+    // End-to-end tunnel test using a fake cloudflared shim in temp PATH
+    const tmpRoot = makeTempDir('kantor-tunnel-');
+    const projectDir = path.join(tmpRoot, 'proj');
+    const storageDir = path.join(tmpRoot, 'storage');
+    const agyHome = path.join(tmpRoot, 'agy-home');
+    const fakeBinDir = path.join(tmpRoot, 'bin');
+    fs.mkdirSync(projectDir, { recursive: true });
+    fs.mkdirSync(storageDir, { recursive: true });
+    fs.mkdirSync(agyHome, { recursive: true });
+    fs.mkdirSync(fakeBinDir, { recursive: true });
+
+    const port = await findFreePort('127.0.0.1');
+    const fakeScript = path.join(fakeBinDir, 'fake-cloudflared.mjs');
+    fs.writeFileSync(
+      fakeScript,
+      [
+        'const mode = process.env.FAKE_CF_MODE || "crash";',
+        'if (mode === "crash") {',
+        '  console.error("simulated early cloudflared crash");',
+        '  process.exit(1);',
+        '}',
+        'console.error("ARGS=" + JSON.stringify(process.argv.slice(2)));',
+        'console.error("INF | Your quick Tunnel has been created! Visit it at:");',
+        'console.error("INF | https://kantor-demo-tunnel.trycloudflare.com");',
+        'setTimeout(() => process.exit(0), 15000);',
+      ].join('\n'),
+      'utf8'
+    );
+
+    const baseEnv = {
+      KANTOR_STORAGE: storageDir,
+      ANTIGRAVITY_HOME: agyHome,
+      KANTOR_CLOUDFLARED_BIN: fakeScript,
+    };
+
+    try {
+      await runKantorCli(
+        ['start', '--project', projectDir, '--storage', storageDir, '--port', String(port)],
+        baseEnv
+      );
+      const rawToken = fs.readFileSync(path.join(storageDir, 'chat-token'), 'utf8').trim();
+
+      // 1. Crash mode must fail fast (< 4s, not 12s) and leave no tunnel.json or tunnel-url.txt
+      const t0 = Date.now();
+      await assert.rejects(
+        () => runKantorCli(['tunnel', '--project', projectDir, '--storage', storageDir], { ...baseEnv, FAKE_CF_MODE: 'crash' }),
+        (err) => err && err.code === 1 && /simulated early cloudflared crash/i.test(err.stderr || '')
+      );
+      const elapsed = Date.now() - t0;
+      assert.ok(elapsed < 4000, `tunnel early-exit crash should fail fast, took ${elapsed}ms`);
+      assert.equal(fs.existsSync(path.join(storageDir, 'tunnel.json')), false);
+      assert.equal(fs.existsSync(path.join(storageDir, 'tunnel-url.txt')), false);
+
+      // 2. Success mode prints public URL + token file path without printing raw token or ?token=
+      const tunOk = await runKantorCli(
+        ['tunnel', '--project', projectDir, '--storage', storageDir],
+        { ...baseEnv, FAKE_CF_MODE: 'ok' }
+      );
+      assert.ok(tunOk.stdout.includes('https://kantor-demo-tunnel.trycloudflare.com/kerja'));
+      assert.ok(tunOk.stdout.includes(path.join(storageDir, 'chat-token')));
+      assert.equal(tunOk.stdout.includes(rawToken), false, 'tunnel stdout must not print raw chat-token');
+      assert.equal(tunOk.stdout.includes('?token='), false, 'tunnel stdout must not print ?token=');
+      assert.equal(
+        fs.readFileSync(path.join(storageDir, 'tunnel-url.txt'), 'utf8').trim(),
+        'https://kantor-demo-tunnel.trycloudflare.com/kerja'
+      );
+
+      // 3. tunnel-stop cleans up tunnel process and files
+      await runKantorCli(['tunnel-stop', '--project', projectDir, '--storage', storageDir], baseEnv);
+      assert.equal(fs.existsSync(path.join(storageDir, 'tunnel.json')), false);
+      assert.equal(fs.existsSync(path.join(storageDir, 'tunnel-url.txt')), false);
+    } finally {
+      try {
+        await runKantorCli(['stop', '--project', projectDir, '--storage', storageDir], baseEnv);
+      } catch {}
+      try {
+        const tMeta = JSON.parse(fs.readFileSync(path.join(storageDir, 'tunnel.json'), 'utf8'));
+        killPidBestEffort(tMeta?.pid);
+      } catch {}
+      try {
+        const sMeta = JSON.parse(fs.readFileSync(path.join(storageDir, 'server.json'), 'utf8'));
+        killPidBestEffort(sMeta?.pid);
+      } catch {}
+      cleanDir(tmpRoot);
+    }
+  });
 });
