@@ -350,14 +350,16 @@ async function handleChat(req, res, pathname, method, { cfg, authManager, acpBri
     return sendJson(res, 200, result && typeof result === 'object' ? result : { ok: true });
   } catch (err) {
     const isClientError = Number.isInteger(err?.status) && err.status >= 400 && err.status < 500;
-    const status = isClientError ? err.status : 500;
+    const isSafe503 = err?.status === 503 && err?.publicSafe === true;
+    const status = isClientError || isSafe503 ? err.status : 500;
+    const canExpose = isClientError || isSafe503;
     const payload =
       isClientError && err?.body && typeof err.body === 'object'
         ? err.body
         : {
             ok: false,
             error:
-              isClientError && typeof err?.message === 'string' && err.message
+              canExpose && typeof err?.message === 'string' && err.message
                 ? err.message
                 : 'Kesalahan jembatan ACP',
           };

@@ -10,8 +10,8 @@ const DEFAULT_RPC_TIMEOUT_MS = 30_000;
 const SSE_HEARTBEAT_MS = 20_000;
 const SHUTDOWN_KILL_WAIT_MS = 400;
 
-function httpError(status, message) {
-  return Object.assign(new Error(message), { status });
+function httpError(status, message, { publicSafe = false } = {}) {
+  return Object.assign(new Error(message), { status, ...(publicSafe ? { publicSafe: true } : {}) });
 }
 
 function isMethodNotFoundError(err) {
@@ -120,7 +120,7 @@ export class AcpBridge {
     const rawModel = this.cfg?.chat?.default_model;
     this.defaultModel =
       typeof rawModel === 'string' && rawModel.trim() !== '' ? rawModel.trim() : null;
-    this.sandbox = Boolean(this.cfg?.chat?.sandbox);
+    this.sandbox = this.cfg?.chat?.sandbox === true;
 
     this.isSessionRunningOutsideAcp =
       typeof isSessionRunningOutsideAcp === 'function' ? isSessionRunningOutsideAcp : () => false;
@@ -136,6 +136,8 @@ export class AcpBridge {
     this.busy = false;
     this.starting = false;
     this.shuttingDown = false;
+    this._sessionBusy = false;
+    this._turnEpoch = 0;
     this.sessionId = null;
     this.mode = this.defaultMode;
     this.model = this.defaultModel;
@@ -147,6 +149,7 @@ export class AcpBridge {
     this.sseClients = new Set();
 
     this.child = null;
+    this._boundChild = null;
     this._stdoutDecoder = new StringDecoder('utf8');
     this._stdoutBuffer = '';
     this._skipOversizedLine = false;
@@ -440,6 +443,15 @@ export class AcpBridge {
   }
 
   _handlePermissionRequest(msg) {
+    if (this.shuttingDown) {
+      this._writeRpc({
+        jsonrpc: '2.0',
+        id: msg.id,
+        result: { outcome: { outcome: 'cancelled' } },
+      });
+      return;
+    }
+
     const rpcId = msg.id;
     const requestId = String(rpcId);
     const params = isPlainObj(msg.params) ? msg.params : {};
@@ -645,10 +657,13 @@ export class AcpBridge {
   _handleChildExit(child, errMessage, isError) {
     if (this.child === child) {
       this.child = null;
+      this._boundChild = null;
       this.connected = false;
       this.busy = false;
       this.sessionId = null;
       this._initResult = null;
+    } else if (this._boundChild === child) {
+      this._boundChild = null;
     }
 
     if (isError && errMessage && !this.shuttingDown) {
@@ -743,7 +758,7 @@ export class AcpBridge {
       onDisconnect(err?.message || 'Gagal menjalankan proses agy ACP', true);
     });
 
-    child.on('exit', (code, signal) => {
+    child.on('close', (code, signal) => {
       const unexpected = !this.shuttingDown && (code !== 0 || signal !== null);
       const msg = unexpected
         ? `Proses ACP berhenti (${signal ? `signal ${signal}` : `exit ${code}`})${this._lastStderr.trim() ? `: ${this._lastStderr.trim()}` : ''}`
@@ -757,6 +772,7 @@ export class AcpBridge {
   async _terminateChild() {
     const child = this.child;
     if (!child) {
+      this._boundChild = null;
       this.connected = false;
       this.busy = false;
       this.sessionId = null;
@@ -766,6 +782,7 @@ export class AcpBridge {
     if (child.exitCode !== null || child.signalCode !== null) {
       if (this.child === child) {
         this.child = null;
+        this._boundChild = null;
         this.sessionId = null;
       }
       this.connected = false;
@@ -783,10 +800,11 @@ export class AcpBridge {
         settled = true;
         clearTimeout(killTimer);
         clearTimeout(hardTimer);
-        child.off('exit', finish);
         child.off('close', finish);
+        child.off('error', finish);
         if (this.child === child) {
           this.child = null;
+          this._boundChild = null;
           this.sessionId = null;
         }
         this.connected = false;
@@ -794,8 +812,8 @@ export class AcpBridge {
         resolve();
       };
 
-      child.once('exit', finish);
       child.once('close', finish);
+      child.once('error', finish);
 
       try {
         child.stdin?.end();
@@ -830,7 +848,7 @@ export class AcpBridge {
 
   async ensureConnected() {
     if (this.shuttingDown) {
-      throw httpError(503, 'Jembatan ACP sedang dimatikan');
+      throw httpError(503, 'Jembatan ACP sedang dimatikan', { publicSafe: true });
     }
     if (this.connected && this.child && this.child.exitCode === null && this.child.signalCode === null) {
       return this._initResult;
@@ -902,12 +920,13 @@ export class AcpBridge {
     }
 
     this.sessionId = newSessionId;
+    this._boundChild = this.child;
+    await this._applySessionMode(this.sessionId, targetMode);
     this.mode = targetMode;
-    this.model = targetModel;
-    await this._applySessionMode(this.sessionId, this.mode);
-    if (this.model !== null) {
-      await this._applySessionModel(this.sessionId, this.model);
+    if (targetModel !== null) {
+      await this._applySessionModel(this.sessionId, targetModel);
     }
+    this.model = targetModel;
 
     this._pushHistory({
       type: 'session',
@@ -936,12 +955,17 @@ export class AcpBridge {
     const { mode, model } = isPlainObj(opts) ? opts : {};
     this._validateConfigArgs({ mode, model });
     if (this.shuttingDown) {
-      throw httpError(503, 'Jembatan ACP sedang dimatikan');
+      throw httpError(503, 'Jembatan ACP sedang dimatikan', { publicSafe: true });
     }
-    if (this.busy || this.starting) {
+    if (this.busy || this.starting || this._sessionBusy) {
       throw httpError(409, 'Ketua sedang memproses giliran aktif');
     }
-    return this._createSessionInternal({ mode, model });
+    this._sessionBusy = true;
+    try {
+      return await this._createSessionInternal({ mode, model });
+    } finally {
+      this._sessionBusy = false;
+    }
   }
 
   async loadSession(id) {
@@ -954,18 +978,19 @@ export class AcpBridge {
     }
 
     if (this.shuttingDown) {
-      throw httpError(503, 'Jembatan ACP sedang dimatikan');
+      throw httpError(503, 'Jembatan ACP sedang dimatikan', { publicSafe: true });
     }
-    if (this.busy || this.starting) {
+    if (this.busy || this.starting || this._sessionBusy) {
       throw httpError(409, 'Ketua sedang memproses giliran aktif');
     }
 
     if (
-      sessionId === this.sessionId &&
       this.connected &&
       this.child &&
       this.child.exitCode === null &&
-      this.child.signalCode === null
+      this.child.signalCode === null &&
+      this._boundChild === this.child &&
+      this.sessionId === sessionId
     ) {
       return {
         ok: true,
@@ -975,60 +1000,70 @@ export class AcpBridge {
       };
     }
 
-    if (await this.isSessionRunningOutsideAcp(sessionId)) {
-      throw httpError(409, 'Sesi sedang berjalan di luar ACP');
-    }
-    if (this.isCliSession && !(await this.isCliSession(sessionId))) {
-      throw httpError(409, 'Hanya sesi root CLI/ACP proyek yang dapat dimuat');
-    }
-
-    await this.ensureConnected();
-    await this._sendRpc('session/load', {
-      sessionId,
-      cwd: this.projectDir,
-      mcpServers: [],
-    });
-
-    this.sessionId = sessionId;
-    this._pushHistory({
-      type: 'session',
-      action: 'load',
-      sessionId: this.sessionId,
-      mode: this.mode,
-      model: this.model,
-    });
-    this._broadcastSse('session', {
-      action: 'load',
-      sessionId: this.sessionId,
-      mode: this.mode,
-      model: this.model,
-    });
-    this._broadcastSse('status', this.getStatus());
-
-    return {
-      ok: true,
-      sessionId: this.sessionId,
-      mode: this.mode,
-      model: this.model,
-    };
-  }
-
-  async setConfig({ mode, model } = {}) {
-    this._validateConfigArgs({ mode, model });
-
-    if (mode !== undefined) {
-      this.mode = mode;
-      if (this.connected && this.sessionId) {
-        await this._applySessionMode(this.sessionId, this.mode);
+    this._sessionBusy = true;
+    try {
+      if (await this.isSessionRunningOutsideAcp(sessionId)) {
+        throw httpError(409, 'Sesi sedang berjalan di luar ACP');
       }
-    }
-    if (model !== undefined) {
-      this.model = model === null ? null : model.trim();
-      if (this.connected && this.sessionId && this.model !== null) {
+      if (this.isCliSession && !(await this.isCliSession(sessionId))) {
+        throw httpError(409, 'Hanya sesi root CLI/ACP proyek yang dapat dimuat');
+      }
+
+      await this.ensureConnected();
+      await this._sendRpc('session/load', {
+        sessionId,
+        cwd: this.projectDir,
+        mcpServers: [],
+      });
+
+      this.sessionId = sessionId;
+      this._boundChild = this.child;
+      await this._applySessionMode(this.sessionId, this.mode);
+      if (this.model !== null) {
         await this._applySessionModel(this.sessionId, this.model);
       }
+
+      this._pushHistory({
+        type: 'session',
+        action: 'load',
+        sessionId: this.sessionId,
+        mode: this.mode,
+        model: this.model,
+      });
+      this._broadcastSse('session', {
+        action: 'load',
+        sessionId: this.sessionId,
+        mode: this.mode,
+        model: this.model,
+      });
+      this._broadcastSse('status', this.getStatus());
+
+      return {
+        ok: true,
+        sessionId: this.sessionId,
+        mode: this.mode,
+        model: this.model,
+      };
+    } finally {
+      this._sessionBusy = false;
+    }
+  }
+
+  async _applyConfigInternal({ mode, model } = {}) {
+    const nextMode = mode !== undefined ? mode : this.mode;
+    const nextModel = model !== undefined ? (model === null ? null : model.trim()) : this.model;
+
+    if (this.connected && this.sessionId && this._boundChild === this.child) {
+      if (mode !== undefined) {
+        await this._applySessionMode(this.sessionId, nextMode);
+      }
+      if (model !== undefined && nextModel !== null) {
+        await this._applySessionModel(this.sessionId, nextModel);
+      }
     }
 
+    this.mode = nextMode;
+    this.model = nextModel;
     this._broadcastSse('status', this.getStatus());
     return {
       ok: true,
@@ -1036,6 +1071,23 @@ export class AcpBridge {
       model: this.model,
       status: this.getStatus(),
     };
+  }
+
+  async setConfig({ mode, model } = {}) {
+    this._validateConfigArgs({ mode, model });
+    if (this.shuttingDown) {
+      throw httpError(503, 'Jembatan ACP sedang dimatikan', { publicSafe: true });
+    }
+    if (this.busy || this.starting || this._sessionBusy) {
+      throw httpError(409, 'Ketua sedang memproses giliran aktif');
+    }
+
+    this._sessionBusy = true;
+    try {
+      return await this._applyConfigInternal({ mode, model });
+    } finally {
+      this._sessionBusy = false;
+    }
   }
 
   async sendPrompt(input) {
@@ -1059,13 +1111,14 @@ export class AcpBridge {
     this._validateConfigArgs({ mode, model });
 
     if (this.shuttingDown) {
-      throw httpError(503, 'Jembatan ACP sedang dimatikan');
+      throw httpError(503, 'Jembatan ACP sedang dimatikan', { publicSafe: true });
     }
-    if (this.busy || this.starting) {
+    if (this.busy || this.starting || this._sessionBusy) {
       throw httpError(409, 'Ketua sedang memproses giliran aktif');
     }
 
     const text = rawText.trim();
+    const turnEpoch = this._turnEpoch;
     this.busy = true;
     this.lastError = null;
 
@@ -1074,9 +1127,22 @@ export class AcpBridge {
         await this._createSessionInternal({ mode, model });
       } else {
         await this.ensureConnected();
-        if (mode !== undefined || model !== undefined) {
-          await this.setConfig({ mode, model });
+        if (this._boundChild !== this.child) {
+          this.sessionId = null;
+          await this._createSessionInternal({ mode, model });
+        } else if (mode !== undefined || model !== undefined) {
+          await this._applyConfigInternal({ mode, model });
         }
+      }
+
+      if (this.shuttingDown || turnEpoch !== this._turnEpoch) {
+        this.busy = false;
+        this._turnPromise = null;
+        if (this.shuttingDown) {
+          throw httpError(503, 'Jembatan ACP sedang dimatikan', { publicSafe: true });
+        }
+        this._broadcastSse('status', this.getStatus());
+        throw httpError(409, 'Giliran dibatalkan saat memulai sesi');
       }
 
       const activeSessionId = this.sessionId;
@@ -1207,6 +1273,7 @@ export class AcpBridge {
   }
 
   async cancelTurn() {
+    this._turnEpoch += 1;
     this._clearPendingPermissions({
       writeCancel: true,
       eventName: 'permission_resolved',
@@ -1233,11 +1300,8 @@ export class AcpBridge {
 
     this._validateConfigArgs({ mode: params.mode, model: params.model });
 
-    const hasSessionId =
-      params.sessionId !== undefined && params.sessionId !== null && String(params.sessionId).trim() !== '';
-
-    if (hasSessionId) {
-      await this.loadSession(String(params.sessionId));
+    if ('sessionId' in params && params.sessionId !== undefined && params.sessionId !== null) {
+      await this.loadSession(params.sessionId);
       if (params.mode !== undefined || params.model !== undefined) {
         await this.setConfig({ mode: params.mode, model: params.model });
       }
@@ -1269,6 +1333,7 @@ export class AcpBridge {
 
     this._shutdownPromise = (async () => {
       this.shuttingDown = true;
+      this._turnEpoch += 1;
 
       if (this.busy && this.sessionId && this.child?.stdin?.writable && !this.child.stdin.destroyed) {
         this._sendNotification('session/cancel', { sessionId: this.sessionId });
@@ -1289,6 +1354,7 @@ export class AcpBridge {
       }
 
       await this._terminateChild();
+      this._boundChild = null;
       this._initResult = null;
       this._turnPromise = null;
     })();

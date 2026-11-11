@@ -62,9 +62,62 @@ function cancelActiveTurn() {
 
 function handlePrompt(msg) {
   const params = msg.params && typeof msg.params === 'object' ? msg.params : {};
-  const sessionId = typeof params.sessionId === 'string' ? params.sessionId : 'cli-sess-new-1';
+  const sessionId = typeof params.sessionId === 'string' ? params.sessionId : '';
+  if (!sessionId || !sessions.has(sessionId)) {
+    send({
+      jsonrpc: '2.0',
+      id: msg.id,
+      error: { code: -32602, message: `Unknown sessionId: ${sessionId}` },
+    });
+    return;
+  }
   const promptParts = Array.isArray(params.prompt) ? params.prompt : [];
   const text = promptParts.map((p) => (typeof p?.text === 'string' ? p.text : '')).join('');
+
+  if (text.includes('__SPLIT_UTF8__')) {
+    const rawLine = Buffer.from(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: 'Halo 🚀 dunia' },
+          },
+        },
+      }) + '\n',
+      'utf8'
+    );
+    const rocketIdx = rawLine.indexOf(Buffer.from('🚀', 'utf8'));
+    const splitAt = rocketIdx + 2;
+    process.stdout.write(rawLine.subarray(0, splitAt));
+    setTimeout(() => {
+      process.stdout.write(rawLine.subarray(splitAt));
+      send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+    }, 15);
+    return;
+  }
+
+  if (text.includes('__TRAILING_FRAME_EXIT__')) {
+    send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+    // Tulis frame NDJSON tanpa newline tepat sebelum stdout ditutup dan proses exit
+    process.stdout.write(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: 'Frame terakhir tanpa newline' },
+          },
+        },
+      })
+    );
+    process.stdout.end(() => process.exit(0));
+    return;
+  }
 
   if (text.includes('__CRASH_TURN__')) {
     send({
@@ -323,10 +376,18 @@ function handleMessage(msg) {
         if (process.env.FAKE_AGY_HANG_NEW === '1') {
           return;
         }
-        sessionSeq += 1;
-        const sessionId = `cli-sess-new-${sessionSeq}`;
-        sessions.set(sessionId, { cwd: params.cwd || '', mode: 'accept-edits', model: null });
-        send({ jsonrpc: '2.0', id: msg.id, result: { sessionId } });
+        const respondNew = () => {
+          sessionSeq += 1;
+          const sessionId = `cli-sess-new-${sessionSeq}`;
+          sessions.set(sessionId, { cwd: params.cwd || '', mode: 'accept-edits', model: null });
+          send({ jsonrpc: '2.0', id: msg.id, result: { sessionId } });
+        };
+        const delayNew = Number(process.env.FAKE_AGY_SLOW_NEW_MS);
+        if (Number.isFinite(delayNew) && delayNew > 0) {
+          setTimeout(respondNew, delayNew).unref();
+        } else {
+          respondNew();
+        }
         return;
       }
       case 'session/load': {
@@ -340,24 +401,28 @@ function handleMessage(msg) {
         return;
       }
       case 'session/set_mode': {
-        const sessionId = params.sessionId;
-        const modeId = params.modeId ?? params.mode;
-        if (sessions.has(sessionId)) {
-          sessions.get(sessionId).mode = modeId;
+        const sessionId = typeof params.sessionId === 'string' ? params.sessionId : '';
+        if (!sessionId || !sessions.has(sessionId)) {
+          send({ jsonrpc: '2.0', id: msg.id, error: { code: -32602, message: `Unknown sessionId: ${sessionId}` } });
+          return;
         }
+        const modeId = params.modeId ?? params.mode;
+        sessions.get(sessionId).mode = modeId;
         send({ jsonrpc: '2.0', id: msg.id, result: {} });
         return;
       }
       case 'session/set_model': {
+        const sessionId = typeof params.sessionId === 'string' ? params.sessionId : '';
+        if (!sessionId || !sessions.has(sessionId)) {
+          send({ jsonrpc: '2.0', id: msg.id, error: { code: -32602, message: `Unknown sessionId: ${sessionId}` } });
+          return;
+        }
         if (process.env.FAKE_AGY_UNSUPPORTED_MODEL === '1') {
           send({ jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'Method not found: session/set_model' } });
           return;
         }
-        const sessionId = params.sessionId;
         const modelId = params.modelId ?? params.model;
-        if (sessions.has(sessionId)) {
-          sessions.get(sessionId).model = modelId;
-        }
+        sessions.get(sessionId).model = modelId;
         send({ jsonrpc: '2.0', id: msg.id, result: {} });
         return;
       }

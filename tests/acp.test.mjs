@@ -210,7 +210,17 @@ function openLiveSse(port, reqPath, headers = {}) {
     };
 
     const req = http.request({ host: '127.0.0.1', port, method: 'GET', path: reqPath, headers }, (res) => {
+      let ended = false;
+      const endWaiters = [];
       res.setEncoding('utf8');
+      res.on('end', () => {
+        ended = true;
+        while (endWaiters.length) endWaiters.shift()();
+      });
+      res.on('close', () => {
+        ended = true;
+        while (endWaiters.length) endWaiters.shift()();
+      });
       res.on('data', (chunk) => {
         rawText += chunk;
         buffer += chunk;
@@ -240,6 +250,18 @@ function openLiveSse(port, reqPath, headers = {}) {
         status: res.statusCode,
         headers: res.headers,
         events,
+        isEnded: () => ended,
+        waitForEnd(timeoutMs = 3000) {
+          if (ended) return Promise.resolve();
+          return new Promise((resEnd, rejEnd) => {
+            const t = setTimeout(() => rejEnd(new Error('Timeout waiting for SSE end')), timeoutMs);
+            t.unref();
+            endWaiters.push(() => {
+              clearTimeout(t);
+              resEnd();
+            });
+          });
+        },
         getRawText: () => rawText,
         waitForEvent(eventName, timeoutMs = 4000, predicate = null) {
           const existing = events.find((e) => e.event === eventName && (!predicate || predicate(e.data)));
@@ -517,23 +539,28 @@ describe('AcpBridge (lib/acp.mjs)', () => {
     const bridgeShutdown = new AcpBridge({ projectDir: dir, agyBin: FAKE_AGY, permissionTimeoutMs: 60_000 });
     const sseShutdown = createMockSseRes();
     try {
-      bridgeShutdown.subscribeSse(sseShutdown);
-      await bridgeShutdown.sendPrompt('__NEED_PERM__');
-      await sseShutdown.waitForEvent('permission_request');
-      assert.equal(bridgeShutdown.getStatus().pendingPermissionCount, 1);
+      try {
+        bridgeShutdown.subscribeSse(sseShutdown);
+        await bridgeShutdown.sendPrompt('__NEED_PERM__');
+        await sseShutdown.waitForEvent('permission_request');
+        assert.equal(bridgeShutdown.getStatus().pendingPermissionCount, 1);
 
-      const childRef = bridgeShutdown.child;
-      assert.ok(childRef && childRef.pid);
+        const childRef = bridgeShutdown.child;
+        assert.ok(childRef && childRef.pid);
 
-      const t0 = Date.now();
-      await bridgeShutdown.shutdown();
-      const elapsed = Date.now() - t0;
-      assert.ok(elapsed < 2000, `shutdown harus cepat (< 2000ms), aktual ${elapsed}ms`);
-      assert.equal(bridgeShutdown.getStatus().connected, false);
-      assert.equal(bridgeShutdown.getStatus().busy, false);
-      assert.equal(bridgeShutdown.getStatus().pendingPermissionCount, 0);
-      assert.equal(sseShutdown.writableEnded, true);
-      assert.ok(childRef.exitCode !== null || childRef.signalCode !== null || childRef.killed);
+        const t0 = Date.now();
+        await bridgeShutdown.shutdown();
+        const elapsed = Date.now() - t0;
+        assert.ok(elapsed < 2000, `shutdown harus cepat (< 2000ms), aktual ${elapsed}ms`);
+        assert.equal(bridgeShutdown.getStatus().connected, false);
+        assert.equal(bridgeShutdown.getStatus().busy, false);
+        assert.equal(bridgeShutdown.getStatus().sessionId, null);
+        assert.equal(bridgeShutdown.getStatus().pendingPermissionCount, 0);
+        assert.equal(sseShutdown.writableEnded, true);
+        assert.ok(childRef.exitCode !== null || childRef.signalCode !== null || childRef.killed);
+      } finally {
+        await bridgeShutdown.shutdown();
+      }
     } finally {
       cleanDir(dir);
     }
@@ -660,6 +687,76 @@ describe('AcpBridge (lib/acp.mjs)', () => {
         } finally {
           await bridgeCmd.shutdown();
         }
+      }
+
+      // 6. Multi-byte UTF-8 split across chunks & trailing NDJSON frame emitted right before stdout close
+      const bridgeFrames = new AcpBridge({ projectDir: dir, agyBin: FAKE_AGY });
+      const sseFrames = createMockSseRes();
+      try {
+        bridgeFrames.subscribeSse(sseFrames);
+        await bridgeFrames.sendPrompt('__SPLIT_UTF8__');
+        await bridgeFrames.waitForTurn();
+        await sseFrames.waitForEvent('session_update', 3000, (d) => String(d.text).includes('Halo 🚀 dunia'));
+
+        await bridgeFrames.sendPrompt('__TRAILING_FRAME_EXIT__');
+        await bridgeFrames.waitForTurn();
+        await sseFrames.waitForEvent('session_update', 3000, (d) =>
+          String(d.text).includes('Frame terakhir tanpa newline')
+        );
+      } finally {
+        await bridgeFrames.shutdown();
+      }
+
+      // 7. fake-agy rejects -32602 for unknown/uncreated sessionId, openSession rejects ""/{} with 400, and _sessionBusy blocks parallel races (409)
+      const prevSlowNew = process.env.FAKE_AGY_SLOW_NEW_MS;
+      process.env.FAKE_AGY_SLOW_NEW_MS = '180';
+      const bridgeRace = new AcpBridge({
+        projectDir: dir,
+        agyBin: FAKE_AGY,
+        isCliSession: () => true,
+      });
+      try {
+        await bridgeRace.ensureConnected();
+        await assert.rejects(
+          () => bridgeRace._sendRpc('session/prompt', { sessionId: 'tidak-pernah-dibuat', prompt: [{ type: 'text', text: 'x' }] }),
+          (err) => err?.code === -32602
+        );
+
+        await assert.rejects(() => bridgeRace.openSession({ sessionId: '' }), (err) => err?.status === 400);
+        await assert.rejects(() => bridgeRace.openSession({ sessionId: {} }), (err) => err?.status === 400);
+
+        const [r1, r2] = await Promise.allSettled([
+          bridgeRace.createSession(),
+          bridgeRace.loadSession('cli-idle'),
+        ]);
+        const fulfilled = [r1, r2].filter((r) => r.status === 'fulfilled');
+        const rejected = [r1, r2].filter((r) => r.status === 'rejected');
+        assert.equal(fulfilled.length, 1);
+        assert.equal(rejected.length, 1);
+        assert.equal(rejected[0].reason?.status, 409);
+      } finally {
+        if (prevSlowNew === undefined) delete process.env.FAKE_AGY_SLOW_NEW_MS;
+        else process.env.FAKE_AGY_SLOW_NEW_MS = prevSlowNew;
+        await bridgeRace.shutdown();
+      }
+
+      // 8. Mid-startup cancellation in sendPrompt() aborts before pushing history or dispatching session/prompt
+      process.env.FAKE_AGY_SLOW_NEW_MS = '220';
+      const bridgeStartupCancel = new AcpBridge({ projectDir: dir, agyBin: FAKE_AGY });
+      try {
+        const sendPromise = bridgeStartupCancel.sendPrompt('Jangan pernah dikirim');
+        await new Promise((r) => setTimeout(r, 40));
+        await bridgeStartupCancel.cancelTurn();
+        await assert.rejects(() => sendPromise, (err) => err?.status === 409);
+        assert.equal(bridgeStartupCancel.getStatus().busy, false);
+        assert.equal(
+          bridgeStartupCancel.getHistory().some((h) => h.role === 'user' && h.text === 'Jangan pernah dikirim'),
+          false
+        );
+      } finally {
+        if (prevSlowNew === undefined) delete process.env.FAKE_AGY_SLOW_NEW_MS;
+        else process.env.FAKE_AGY_SLOW_NEW_MS = prevSlowNew;
+        await bridgeStartupCancel.shutdown();
       }
     } finally {
       if (prevRpcLog === undefined) delete process.env.FAKE_AGY_RPC_LOG;
@@ -814,7 +911,7 @@ describe('serve.mjs + AcpBridge HTTP integration', () => {
       assert.equal(reloadSelf.status, 200);
       assert.equal(reloadSelf.json.sessionId, 'cli-idle-1');
 
-      // Slow turn + cancel via HTTP
+      // Slow turn + concurrent HTTP 409 + cancel via HTTP
       const sendSlow = await rawRequest(port, {
         method: 'POST',
         reqPath: '/kerja/api/chat/send',
@@ -823,6 +920,14 @@ describe('serve.mjs + AcpBridge HTTP integration', () => {
       });
       assert.equal(sendSlow.status, 202);
       await liveSse.waitForEvent('session_update', 3000, (d) => String(d.text).includes('tugas panjang'));
+
+      const sendConflictHttp = await rawRequest(port, {
+        method: 'POST',
+        reqPath: '/kerja/api/chat/send',
+        headers: { Host: `127.0.0.1:${port}`, Origin: origin, Cookie: cookiePair, 'Content-Type': 'application/json' },
+        body: { text: 'Konflik saat sibuk' },
+      });
+      assert.equal(sendConflictHttp.status, 409);
 
       const cancelHttp = await rawRequest(port, {
         method: 'POST',
@@ -834,11 +939,13 @@ describe('serve.mjs + AcpBridge HTTP integration', () => {
       await liveSse.waitForEvent('turn_cancelled');
       await server.acpBridge.waitForTurn();
 
+      // server.close() sambil klien SSE masih terbuka wajib menutup SSE dan child secara bersih
       const spawnedChild = server.acpBridge.child;
       assert.ok(spawnedChild);
-      liveSse.close();
-      liveSse = null;
       await new Promise((resolve) => server.close(resolve));
+      await liveSse.waitForEnd();
+      assert.equal(liveSse.isEnded(), true);
+      liveSse = null;
       assert.equal(server.acpBridge.getStatus().connected, false);
       assert.ok(spawnedChild.exitCode !== null || spawnedChild.signalCode !== null || spawnedChild.killed);
     } finally {
@@ -850,6 +957,54 @@ describe('serve.mjs + AcpBridge HTTP integration', () => {
       else process.env.ANTIGRAVITY_HOME = prevAg;
       if (prevBin === undefined) delete process.env.KANTOR_AGY_BIN;
       else process.env.KANTOR_AGY_BIN = prevBin;
+      cleanDir(base);
+    }
+  });
+
+  it('returns redacted 500 without leaking paths when agyBin is missing (ENOENT)', async () => {
+    const base = makeTempDir('kantor-acp-enoent-');
+    const projectDir = path.join(base, 'project');
+    const storageDir = path.join(base, 'storage');
+    fs.mkdirSync(projectDir, { recursive: true });
+    fs.mkdirSync(storageDir, { recursive: true });
+
+    const missingSecretBin = path.join(base, 'rahasia-internal-tidak-ada', 'agy-secret.exe');
+    const cfg = loadConfig(RUNTIME_DIR, projectDir);
+    const server = createKantorServer({
+      projectDir,
+      runtimeDir: RUNTIME_DIR,
+      storageDir,
+      cfg,
+      agyBin: missingSecretBin,
+    });
+
+    try {
+      await new Promise((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(0, '127.0.0.1', resolve);
+      });
+      const port = server.address().port;
+      const origin = `http://127.0.0.1:${port}`;
+      const authRes = await rawRequest(port, {
+        method: 'POST',
+        reqPath: '/kerja/api/chat/auth',
+        headers: { Host: `127.0.0.1:${port}`, Origin: origin, 'Content-Type': 'application/json' },
+        body: {},
+      });
+      const cookiePair = String(authRes.headers['set-cookie'][0]).split(';')[0];
+
+      const res = await rawRequest(port, {
+        method: 'POST',
+        reqPath: '/kerja/api/chat/send',
+        headers: { Host: `127.0.0.1:${port}`, Origin: origin, Cookie: cookiePair, 'Content-Type': 'application/json' },
+        body: { text: 'Halo' },
+      });
+      assert.equal(res.status, 500);
+      assert.equal(res.json?.ok, false);
+      assert.equal(res.text.includes('rahasia-internal-tidak-ada'), false);
+      assert.equal(res.text.includes('agy-secret.exe'), false);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
       cleanDir(base);
     }
   });
