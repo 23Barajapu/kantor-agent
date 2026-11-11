@@ -155,7 +155,7 @@ describe('artifacts.mjs', () => {
       }
     });
 
-    it('ignores symlinks that point outside of brainDir', () => {
+    it('ignores symlinks that point outside of brainDir', (t) => {
       const tmp = makeTempDir();
       try {
         const convId = 'd4e5f6a7-b89c-0d1e-2f3a-4b5c6d7e8f90';
@@ -176,14 +176,98 @@ describe('artifacts.mjs', () => {
             path.join(brain, 'escaped-link.md'),
             'file',
           );
-        } catch {
-          // If OS forbids symlink, skip
+        } catch (err) {
+          if (err.code === 'EPERM' || err.code === 'EACCES') {
+            t.skip('OS forbids symlinks');
+            return;
+          }
+          throw err;
         }
 
         const items = scanArtifacts(convId, brain);
         const names = items.map((x) => x.name);
         assert.ok(names.includes('valid.md'));
         assert.ok(!names.includes('escaped-link.md'));
+      } finally {
+        cleanTempDir(tmp);
+      }
+    });
+
+    it('excludes case variations of Scratch/ and .METADATA.JSON in scanArtifacts', () => {
+      const tmp = makeTempDir();
+      try {
+        const convId = 'd5e6f7a8-b9c0-1e2f-3a4b-5c6d7e8f9012';
+        const brain = path.join(tmp, 'brain', convId);
+        fs.mkdirSync(brain, { recursive: true });
+
+        // Uppercase / mixed-case Scratch directories
+        fs.mkdirSync(path.join(brain, 'Scratch'), { recursive: true });
+        fs.writeFileSync(path.join(brain, 'Scratch', 'temp1.md'), '# scratch 1\n');
+        fs.mkdirSync(path.join(brain, 'SCRATCH_DIR'), { recursive: true }); // normal folder with 'scratch' in name is fine unless exact match
+        fs.writeFileSync(path.join(brain, 'normal.md'), '# Normal\n');
+
+        // Uppercase .METADATA.JSON file
+        fs.writeFileSync(path.join(brain, 'task.md'), '# Task\n');
+        fs.writeFileSync(path.join(brain, 'task.md.METADATA.JSON'), JSON.stringify({
+          summary: 'Uppercase metadata',
+        }));
+
+        const items = scanArtifacts(convId, brain);
+        const names = items.map((x) => x.name);
+        assert.ok(!names.some((n) => n.toLowerCase().startsWith('scratch/')));
+        assert.ok(!names.some((n) => n.toLowerCase().endsWith('.metadata.json')));
+        assert.ok(names.includes('normal.md'));
+        assert.ok(names.includes('task.md'));
+      } finally {
+        cleanTempDir(tmp);
+      }
+    });
+
+    it('ignores internal symlinks pointing into forbidden folders (.system_generated, scratch, metadata)', (t) => {
+      const tmp = makeTempDir();
+      try {
+        const convId = 'e6f7a8b9-c0d1-2e3f-4a5b-6c7d8e9f0123';
+        const brain = path.join(tmp, 'brain', convId);
+        fs.mkdirSync(path.join(brain, '.system_generated', 'logs'), { recursive: true });
+        fs.writeFileSync(path.join(brain, '.system_generated', 'logs', 'transcript.jsonl'), '{"type":"USER_INPUT"}\n');
+
+        fs.mkdirSync(path.join(brain, 'scratch'), { recursive: true });
+        fs.writeFileSync(path.join(brain, 'scratch', 'draft.md'), '# draft in scratch\n');
+
+        fs.writeFileSync(path.join(brain, 'task.md'), '# real task\n');
+        fs.writeFileSync(path.join(brain, 'task.md.metadata.json'), '{"summary":"meta"}\n');
+
+        // Internal symlinks
+        try {
+          fs.symlinkSync(
+            path.join(brain, '.system_generated', 'logs', 'transcript.jsonl'),
+            path.join(brain, 'symlink-transcript.json'),
+            'file',
+          );
+          fs.symlinkSync(
+            path.join(brain, 'scratch', 'draft.md'),
+            path.join(brain, 'symlink-draft.md'),
+            'file',
+          );
+          fs.symlinkSync(
+            path.join(brain, 'task.md.metadata.json'),
+            path.join(brain, 'symlink-meta.json'),
+            'file',
+          );
+        } catch (err) {
+          if (err.code === 'EPERM' || err.code === 'EACCES') {
+            t.skip('OS forbids symlinks');
+            return;
+          }
+          throw err;
+        }
+
+        const items = scanArtifacts(convId, brain);
+        const names = items.map((x) => x.name);
+        assert.ok(!names.includes('symlink-transcript.json'));
+        assert.ok(!names.includes('symlink-draft.md'));
+        assert.ok(!names.includes('symlink-meta.json'));
+        assert.ok(names.includes('task.md'));
       } finally {
         cleanTempDir(tmp);
       }
@@ -345,6 +429,64 @@ describe('artifacts.mjs', () => {
       }
     });
 
+    it('processes sub/task.md when root task.md is absent and ignores Scratch/plan.md', () => {
+      const tmp = makeTempDir();
+      try {
+        // Scratch/plan.md should be ignored
+        fs.mkdirSync(path.join(tmp, 'Scratch'), { recursive: true });
+        fs.writeFileSync(path.join(tmp, 'Scratch', 'plan.md'), '- [x] In scratch\n');
+
+        // sub/task.md should NOT be skipped just because its basename is task.md
+        fs.mkdirSync(path.join(tmp, 'sub'), { recursive: true });
+        fs.writeFileSync(path.join(tmp, 'sub', 'task.md'), '- [ ] Subdir task item\n');
+        fs.writeFileSync(path.join(tmp, 'sub', 'task.md.metadata.json'), JSON.stringify({
+          updatedAt: '2026-11-11T13:00:00.000Z',
+        }));
+
+        const result = extractTodos(tmp);
+        assert.ok(result);
+        assert.equal(result.source, 'sub/task.md');
+        assert.equal(result.items.length, 1);
+        assert.equal(result.items[0].text, 'Subdir task item');
+        assert.equal(result.items[0].status, 'pending');
+      } finally {
+        cleanTempDir(tmp);
+      }
+    });
+
+    it('rejects symlinked task.md that escapes brainDir or points to forbidden folder', (t) => {
+      const tmp = makeTempDir();
+      try {
+        const outsideDir = path.join(tmp, 'outside');
+        fs.mkdirSync(outsideDir, { recursive: true });
+        fs.writeFileSync(path.join(outsideDir, 'malicious-task.md'), '- [ ] Escaped external task\n');
+
+        const brain = path.join(tmp, 'brain');
+        fs.mkdirSync(brain, { recursive: true });
+
+        // Symlinked task.md pointing outside
+        try {
+          fs.symlinkSync(
+            path.join(outsideDir, 'malicious-task.md'),
+            path.join(brain, 'task.md'),
+            'file',
+          );
+        } catch (err) {
+          if (err.code === 'EPERM' || err.code === 'EACCES') {
+            t.skip('OS forbids symlinks');
+            return;
+          }
+          throw err;
+        }
+
+        // extractTodos should reject escaped symlink and return null (no other valid files)
+        const result = extractTodos(brain);
+        assert.equal(result, null);
+      } finally {
+        cleanTempDir(tmp);
+      }
+    });
+
     it('returns null if all markdown files contain no checklist items', () => {
       const tmp = makeTempDir();
       try {
@@ -420,8 +562,12 @@ describe('artifacts.mjs', () => {
           '.system_generated/logs/transcript.jsonl',
           '.user_uploaded/document.pdf',
           'scratch/draft.md',
+          'Scratch/draft.md',
+          'SCRATCH/draft.md',
           '.hidden/file.md',
           'task.md.metadata.json',
+          'task.md.METADATA.JSON',
+          'task.md.Metadata.json',
           'unsupported.py',
           'binary.exe',
           'archive.zip',
@@ -443,7 +589,7 @@ describe('artifacts.mjs', () => {
       }
     });
 
-    it('rejects symlinks that escape brainDir with status 403', () => {
+    it('rejects symlinks that escape brainDir with status 403', (t) => {
       const tmp = makeTempDir();
       try {
         const root = path.join(tmp, 'gemini-root');
@@ -456,8 +602,12 @@ describe('artifacts.mjs', () => {
         const symlinkPath = path.join(brain, 'escape.md');
         try {
           fs.symlinkSync(outsideSecret, symlinkPath, 'file');
-        } catch {
-          // If OS forbids symlink, skip
+        } catch (err) {
+          if (err.code === 'EPERM' || err.code === 'EACCES') {
+            t.skip('OS forbids symlinks');
+            return;
+          }
+          throw err;
         }
 
         const allowed = new Set([validConvId]);
@@ -468,6 +618,83 @@ describe('artifacts.mjs', () => {
           roots: [root],
         });
 
+        assert.equal(res.ok, false);
+        assert.equal(res.status, 403);
+        assert.equal(res.error, 'Akses artifact ditolak');
+      } finally {
+        cleanTempDir(tmp);
+      }
+    });
+
+    it('rejects internal symlinks pointing to forbidden files or dirs with status 403', (t) => {
+      const tmp = makeTempDir();
+      try {
+        const root = path.join(tmp, 'gemini-root');
+        const brain = path.join(root, 'brain', validConvId);
+        fs.mkdirSync(path.join(brain, '.system_generated', 'logs'), { recursive: true });
+        fs.writeFileSync(path.join(brain, '.system_generated', 'logs', 'transcript.jsonl'), '{"type":"GENERIC"}\n');
+
+        fs.mkdirSync(path.join(brain, 'scratch'), { recursive: true });
+        fs.writeFileSync(path.join(brain, 'scratch', 'draft.md'), '# scratch file\n');
+
+        fs.writeFileSync(path.join(brain, 'task.md'), '# Task\n');
+        fs.writeFileSync(path.join(brain, 'task.md.metadata.json'), '{"summary":"meta"}\n');
+
+        try {
+          fs.symlinkSync(
+            path.join(brain, '.system_generated', 'logs', 'transcript.jsonl'),
+            path.join(brain, 'symlink-transcript.json'),
+            'file',
+          );
+          fs.symlinkSync(
+            path.join(brain, 'scratch', 'draft.md'),
+            path.join(brain, 'symlink-draft.md'),
+            'file',
+          );
+          fs.symlinkSync(
+            path.join(brain, 'task.md.metadata.json'),
+            path.join(brain, 'symlink-meta.json'),
+            'file',
+          );
+        } catch (err) {
+          if (err.code === 'EPERM' || err.code === 'EACCES') {
+            t.skip('OS forbids symlinks');
+            return;
+          }
+          throw err;
+        }
+
+        const allowed = new Set([validConvId]);
+
+        // Symlink to .system_generated
+        let res = readSafeArtifact({
+          convId: validConvId,
+          relPath: 'symlink-transcript.json',
+          allowedConvIds: allowed,
+          roots: [root],
+        });
+        assert.equal(res.ok, false);
+        assert.equal(res.status, 403);
+        assert.equal(res.error, 'Akses artifact ditolak');
+
+        // Symlink to scratch
+        res = readSafeArtifact({
+          convId: validConvId,
+          relPath: 'symlink-draft.md',
+          allowedConvIds: allowed,
+          roots: [root],
+        });
+        assert.equal(res.ok, false);
+        assert.equal(res.status, 403);
+        assert.equal(res.error, 'Akses artifact ditolak');
+
+        // Symlink to metadata.json
+        res = readSafeArtifact({
+          convId: validConvId,
+          relPath: 'symlink-meta.json',
+          allowedConvIds: allowed,
+          roots: [root],
+        });
         assert.equal(res.ok, false);
         assert.equal(res.status, 403);
         assert.equal(res.error, 'Akses artifact ditolak');

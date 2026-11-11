@@ -42,6 +42,26 @@ function isInsideDir(childPath, parentPath) {
     : childPath.startsWith(prefix);
 }
 
+/**
+ * Memeriksa apakah segmen-segmen relative path aman:
+ * - Tidak boleh kosong, '.', atau '..'
+ * - Tidak boleh diawali '.' (seperti .system_generated, .user_uploaded, .git)
+ * - Tidak boleh 'scratch' (case-insensitive)
+ * - File tidak boleh berakhiran '.metadata.json' (case-insensitive)
+ */
+function isSafeRelativePath(rel) {
+  if (!rel || typeof rel !== 'string') return false;
+  const segments = rel.split(/[/\\]/);
+  for (const seg of segments) {
+    if (!seg || seg === '.' || seg === '..') return false;
+    if (seg.startsWith('.')) return false;
+    if (seg.toLowerCase() === 'scratch') return false;
+  }
+  const baseName = segments[segments.length - 1].toLowerCase();
+  if (baseName.endsWith('.metadata.json')) return false;
+  return true;
+}
+
 function parseChecklistFile(filePath, relPath) {
   const text = readText(filePath);
   if (text === null) return null;
@@ -120,8 +140,9 @@ export function scanArtifacts(convId, brainDir) {
 
     for (const entry of entries) {
       const name = entry.name;
+      const lowerName = name.toLowerCase();
       if (name.startsWith('.')) continue;
-      if (name === 'scratch') continue;
+      if (lowerName === 'scratch') continue;
 
       const fullPath = path.join(currentDir, name);
 
@@ -133,8 +154,16 @@ export function scanArtifacts(convId, brainDir) {
           continue;
         }
         if (!isInsideDir(realSubDir, realBrainDir)) continue;
+        const resolvedRelSub = path.relative(realBrainDir, realSubDir);
+        if (!isSafeRelativePath(resolvedRelSub)) continue;
         walk(fullPath);
       } else if (entry.isFile() || entry.isSymbolicLink()) {
+        if (lowerName.endsWith('.metadata.json')) continue;
+
+        const ext = path.extname(name).toLowerCase();
+        const extInfo = ALLOWED_EXT_MAP[ext];
+        if (!extInfo) continue;
+
         let realFilePath;
         try {
           realFilePath = fs.realpathSync.native(fullPath);
@@ -143,6 +172,12 @@ export function scanArtifacts(convId, brainDir) {
         }
         if (!isInsideDir(realFilePath, realBrainDir)) continue;
 
+        const resolvedRel = path.relative(realBrainDir, realFilePath);
+        if (!isSafeRelativePath(resolvedRel)) continue;
+
+        const realExt = path.extname(realFilePath).toLowerCase();
+        if (!ALLOWED_EXT_MAP[realExt]) continue;
+
         let st;
         try {
           st = fs.statSync(realFilePath);
@@ -150,12 +185,6 @@ export function scanArtifacts(convId, brainDir) {
           continue;
         }
         if (!st.isFile()) continue;
-
-        if (name.endsWith('.metadata.json')) continue;
-
-        const ext = path.extname(name).toLowerCase();
-        const extInfo = ALLOWED_EXT_MAP[ext];
-        if (!extInfo) continue;
 
         const relPath = path.relative(brainDir, fullPath).replaceAll('\\', '/');
 
@@ -230,12 +259,22 @@ export function extractTodos(brainDir) {
     return null;
   }
 
-  // 1. Cek task.md di level teratas
+  // 1. Cek task.md di level teratas (validasi symlink dan batas brainDir)
   const taskFile = path.join(brainDir, 'task.md');
   if (isFile(taskFile)) {
-    const taskResult = parseChecklistFile(taskFile, 'task.md');
-    if (taskResult !== null) {
-      return taskResult;
+    let realTaskFile = null;
+    try {
+      realTaskFile = fs.realpathSync.native(taskFile);
+    } catch {}
+
+    if (realTaskFile && isInsideDir(realTaskFile, realBrainDir)) {
+      const resolvedRel = path.relative(realBrainDir, realTaskFile);
+      if (isSafeRelativePath(resolvedRel)) {
+        const taskResult = parseChecklistFile(realTaskFile, 'task.md');
+        if (taskResult !== null) {
+          return taskResult;
+        }
+      }
     }
   }
 
@@ -252,8 +291,9 @@ export function extractTodos(brainDir) {
 
     for (const entry of entries) {
       const name = entry.name;
+      const lowerName = name.toLowerCase();
       if (name.startsWith('.')) continue;
-      if (name === 'scratch') continue;
+      if (lowerName === 'scratch') continue;
 
       const fullPath = path.join(currentDir, name);
 
@@ -265,11 +305,13 @@ export function extractTodos(brainDir) {
           continue;
         }
         if (!isInsideDir(realSub, realBrainDir)) continue;
+        const resolvedRelSub = path.relative(realBrainDir, realSub);
+        if (!isSafeRelativePath(resolvedRelSub)) continue;
         walkMd(fullPath);
       } else if (entry.isFile() || entry.isSymbolicLink()) {
-        if (name === 'task.md') continue; // sudah dicek di atas
-        if (name.endsWith('.metadata.json')) continue;
-        if (!name.toLowerCase().endsWith('.md')) continue;
+        if (lowerName === 'task.md' && currentDir === brainDir) continue;
+        if (lowerName.endsWith('.metadata.json')) continue;
+        if (!lowerName.endsWith('.md')) continue;
 
         let realFile;
         try {
@@ -278,6 +320,12 @@ export function extractTodos(brainDir) {
           continue;
         }
         if (!isInsideDir(realFile, realBrainDir)) continue;
+
+        const resolvedRel = path.relative(realBrainDir, realFile);
+        if (!isSafeRelativePath(resolvedRel)) continue;
+
+        const realExt = path.extname(realFile).toLowerCase();
+        if (realExt !== '.md') continue;
 
         let st;
         try {
@@ -301,7 +349,7 @@ export function extractTodos(brainDir) {
         }
 
         const relPath = path.relative(brainDir, fullPath).replaceAll('\\', '/');
-        mdCandidates.push({ fullPath, relPath, sortingMs });
+        mdCandidates.push({ fullPath: realFile, relPath, sortingMs });
       }
     }
   }
@@ -366,12 +414,12 @@ export function readSafeArtifact({ convId, relPath, allowedConvIds, roots, isLoo
 
   const segments = relPath.split(/[/\\]/);
   for (const seg of segments) {
-    if (seg === '' || seg === '..' || seg.startsWith('.') || seg === 'scratch') {
+    if (seg === '' || seg === '..' || seg.startsWith('.') || seg.toLowerCase() === 'scratch') {
       return { ok: false, status: 403, error: 'Akses artifact ditolak' };
     }
   }
 
-  if (relPath.endsWith('.metadata.json')) {
+  if (relPath.toLowerCase().endsWith('.metadata.json')) {
     return { ok: false, status: 403, error: 'Akses artifact ditolak' };
   }
 
@@ -400,6 +448,17 @@ export function readSafeArtifact({ convId, relPath, allowedConvIds, roots, isLoo
   }
 
   if (!isInsideDir(realTarget, realBrainDir)) {
+    return { ok: false, status: 403, error: 'Akses artifact ditolak' };
+  }
+
+  // Validasi ulang segmen dan ekstensi dari target asli (proteksi symlink internal)
+  const resolvedRel = path.relative(realBrainDir, realTarget);
+  if (!isSafeRelativePath(resolvedRel)) {
+    return { ok: false, status: 403, error: 'Akses artifact ditolak' };
+  }
+
+  const realExt = path.extname(realTarget).toLowerCase();
+  if (!ALLOWED_EXT_MAP[realExt]) {
     return { ok: false, status: 403, error: 'Akses artifact ditolak' };
   }
 
