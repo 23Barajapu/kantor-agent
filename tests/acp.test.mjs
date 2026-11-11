@@ -8,7 +8,7 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { pathToFileURL } from 'node:url';
 
-import { AcpBridge } from '../skills/kantor-agent/runtime/lib/acp.mjs';
+import { AcpBridge, parseModelsOutput, wrapWindowsCmd } from '../skills/kantor-agent/runtime/lib/acp.mjs';
 import { isCliMain } from '../skills/kantor-agent/runtime/lib/transcripts.mjs';
 import { createKantorServer } from '../skills/kantor-agent/runtime/bin/serve.mjs';
 import { loadConfig } from '../skills/kantor-agent/runtime/lib/config.mjs';
@@ -1220,6 +1220,272 @@ describe('serve.mjs + AcpBridge HTTP integration', () => {
     } finally {
       await new Promise((resolve) => server.close(resolve));
       cleanDir(base);
+    }
+  });
+});
+
+describe('Dynamic Model Discovery & Cache (listModels & parseModelsOutput)', () => {
+  describe('parseModelsOutput', () => {
+    it('parses <id>\\t<Display Name> lines across CRLF/LF, ignores lines without \\t, trims whitespace, and falls back name to id', () => {
+      const raw = [
+        'Fetching available models...',
+        'gemini-2.5-pro\tGemini 2.5 Pro',
+        'gemini-2.5-flash\t  Gemini 2.5 Flash  \r',
+        'claude-3-7-sonnet\t',
+        'no-tab-line-should-be-ignored',
+        '  custom-id-only\t  \n',
+        '  qwen-2.5-coder\tQwen 2.5 Coder',
+      ].join('\r\n');
+
+      const parsed = parseModelsOutput(raw);
+      assert.deepEqual(parsed, [
+        { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro' },
+        { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash' },
+        { id: 'claude-3-7-sonnet', name: 'claude-3-7-sonnet' },
+        { id: 'custom-id-only', name: 'custom-id-only' },
+        { id: 'qwen-2.5-coder', name: 'Qwen 2.5 Coder' },
+      ]);
+    });
+
+    it('deduplicates by id keeping first occurrence', () => {
+      const raw = 'gemini-2.5-pro\tFirst Name\ngemini-2.5-pro\tSecond Name\n';
+      const parsed = parseModelsOutput(raw);
+      assert.deepEqual(parsed, [{ id: 'gemini-2.5-pro', name: 'First Name' }]);
+    });
+
+    it('skips empty id, oversized id (>160), oversized name (>200), and caps at 200 entries', () => {
+      const longId = 'a'.repeat(161);
+      const longName = 'b'.repeat(201);
+      const lines = [
+        '\tMissing ID',
+        `valid-id\t${longName}`,
+        `${longId}\tValid Name`,
+      ];
+      for (let i = 0; i < 250; i++) {
+        lines.push(`model-${i}\tModel ${i}`);
+      }
+      const parsed = parseModelsOutput(lines.join('\n'));
+      assert.equal(parsed.length, 200);
+      assert.equal(parsed[0].id, 'model-0');
+      assert.equal(parsed[199].id, 'model-199');
+    });
+
+    it('handles empty or non-string inputs safely', () => {
+      assert.deepEqual(parseModelsOutput(''), []);
+      assert.deepEqual(parseModelsOutput(null), []);
+      assert.deepEqual(parseModelsOutput(undefined), []);
+    });
+  });
+
+  describe('AcpBridge.prototype.listModels', () => {
+    it('runs fake-agy models, caches hit, coalesces parallel calls, and bypasses cache on { force: true }', async () => {
+      const dir = makeTempDir('kantor-acp-models-');
+      const logFile = path.join(dir, 'fake-agy-models.log');
+      const prevLog = process.env.FAKE_AGY_LOG_FILE;
+      const prevDelay = process.env.FAKE_AGY_MODELS_DELAY_MS;
+      process.env.FAKE_AGY_LOG_FILE = logFile;
+      process.env.FAKE_AGY_MODELS_DELAY_MS = '60';
+
+      const bridge = new AcpBridge({
+        projectDir: dir,
+        agyBin: FAKE_AGY,
+        modelsCacheTtlMs: 500,
+      });
+
+      try {
+        // Parallel calls should coalesce into 1 child spawn
+        const [r1, r2, r3] = await Promise.all([
+          bridge.listModels(),
+          bridge.listModels(),
+          bridge.listModels(),
+        ]);
+
+        assert.equal(r1.ok, true);
+        assert.equal(r1.degraded, false);
+        assert.equal(r1.cached, false);
+        assert.equal(r1.source, 'agy-models');
+        assert.equal(r1.error, null);
+        assert.ok(Array.isArray(r1.models) && r1.models.length >= 2);
+        assert.deepEqual(r1.models, r2.models);
+        assert.deepEqual(r1.models, r3.models);
+
+        const spawnLogs = fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean);
+        assert.equal(spawnLogs.length, 1, 'Parallel calls must coalesce into exactly 1 child process');
+
+        // Subsequent call before TTL should be a cache hit
+        const cached = await bridge.listModels();
+        assert.equal(cached.ok, true);
+        assert.equal(cached.degraded, false);
+        assert.equal(cached.cached, true);
+        assert.equal(cached.source, 'cache');
+        assert.equal(cached.error, null);
+        assert.deepEqual(cached.models, r1.models);
+
+        const spawnLogs2 = fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean);
+        assert.equal(spawnLogs2.length, 1, 'Cache hit must not spawn new process');
+
+        // Force refresh should bypass cache and spawn again
+        const forced = await bridge.listModels({ force: true });
+        assert.equal(forced.ok, true);
+        assert.equal(forced.degraded, false);
+        assert.equal(forced.cached, false);
+        assert.equal(forced.source, 'agy-models');
+        assert.equal(forced.error, null);
+
+        const spawnLogs3 = fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean);
+        assert.equal(spawnLogs3.length, 2, 'Forced call must spawn a new process');
+      } finally {
+        if (prevLog === undefined) delete process.env.FAKE_AGY_LOG_FILE;
+        else process.env.FAKE_AGY_LOG_FILE = prevLog;
+        if (prevDelay === undefined) delete process.env.FAKE_AGY_MODELS_DELAY_MS;
+        else process.env.FAKE_AGY_MODELS_DELAY_MS = prevDelay;
+        cleanDir(dir);
+      }
+    });
+
+    it('returns stale cache when subsequent forced call fails, and does not leak paths on ENOENT cold-start', async () => {
+      const dir = makeTempDir('kantor-acp-models-fail-');
+      const bridge = new AcpBridge({
+        projectDir: dir,
+        agyBin: FAKE_AGY,
+      });
+
+      const prevExit = process.env.FAKE_AGY_MODELS_EXIT;
+      try {
+        // 1. Initial successful call warms the cache
+        const warm = await bridge.listModels();
+        assert.equal(warm.ok, true);
+        assert.equal(warm.source, 'agy-models');
+
+        // 2. Subsequent call fails with non-zero exit; returns stale cache
+        process.env.FAKE_AGY_MODELS_EXIT = '1';
+        const stale = await bridge.listModels({ force: true });
+        assert.equal(stale.ok, true);
+        assert.equal(stale.degraded, true);
+        assert.equal(stale.source, 'cache-stale');
+        assert.deepEqual(stale.models, warm.models);
+        assert.ok(typeof stale.error === 'string' && stale.error.length > 0);
+
+        // 3. Cold start with missing binary (ENOENT)
+        const secretPath = path.join(dir, 'rahasia-folder-internal', 'no-such-agy.exe');
+        const brokenBridge = new AcpBridge({
+          projectDir: dir,
+          agyBin: secretPath,
+        });
+
+        const enoentRes = await brokenBridge.listModels();
+        assert.equal(enoentRes.ok, false);
+        assert.equal(enoentRes.degraded, true);
+        assert.equal(enoentRes.source, 'error');
+        assert.deepEqual(enoentRes.models, []);
+        assert.ok(typeof enoentRes.error === 'string' && enoentRes.error.length > 0);
+        assert.equal(enoentRes.error.includes('rahasia-folder-internal'), false, 'Must not leak directory path');
+        assert.equal(enoentRes.error.includes('no-such-agy.exe'), false, 'Must not leak binary name');
+
+        // 4. Cold-start failure is NOT cached permanently: once healthy, succeeds
+        const recoversBridge = new AcpBridge({
+          projectDir: dir,
+          agyBin: FAKE_AGY,
+        });
+        process.env.FAKE_AGY_MODELS_EXIT = '1';
+        const failFirst = await recoversBridge.listModels();
+        assert.equal(failFirst.ok, false);
+        assert.equal(failFirst.source, 'error');
+
+        delete process.env.FAKE_AGY_MODELS_EXIT;
+        const healthySecond = await recoversBridge.listModels();
+        assert.equal(healthySecond.ok, true);
+        assert.equal(healthySecond.source, 'agy-models');
+        assert.ok(healthySecond.models.length > 0);
+      } finally {
+        if (prevExit === undefined) delete process.env.FAKE_AGY_MODELS_EXIT;
+        else process.env.FAKE_AGY_MODELS_EXIT = prevExit;
+        cleanDir(dir);
+      }
+    });
+
+    it('handles modelsTimeoutMs and empty stdout safely', async () => {
+      const dir = makeTempDir('kantor-acp-models-timeout-');
+      const bridgeTimeout = new AcpBridge({
+        projectDir: dir,
+        agyBin: FAKE_AGY,
+        modelsTimeoutMs: 80,
+      });
+
+      const prevDelay = process.env.FAKE_AGY_MODELS_DELAY_MS;
+      const prevOut = process.env.FAKE_AGY_MODELS_OUT;
+      try {
+        process.env.FAKE_AGY_MODELS_DELAY_MS = '300';
+        const timeoutRes = await bridgeTimeout.listModels();
+        assert.equal(timeoutRes.ok, false);
+        assert.equal(timeoutRes.degraded, true);
+        assert.equal(timeoutRes.source, 'error');
+        assert.ok(timeoutRes.error.includes('Batas waktu'));
+
+        delete process.env.FAKE_AGY_MODELS_DELAY_MS;
+
+        // Empty output / 0 parsed models
+        process.env.FAKE_AGY_MODELS_OUT = 'Fetching available models...\nJust a status line without tabs\n';
+        const bridgeEmpty = new AcpBridge({
+          projectDir: dir,
+          agyBin: FAKE_AGY,
+        });
+        const emptyRes = await bridgeEmpty.listModels();
+        assert.equal(emptyRes.ok, false);
+        assert.equal(emptyRes.degraded, true);
+        assert.equal(emptyRes.source, 'error');
+        assert.deepEqual(emptyRes.models, []);
+      } finally {
+        if (prevDelay === undefined) delete process.env.FAKE_AGY_MODELS_DELAY_MS;
+        else process.env.FAKE_AGY_MODELS_DELAY_MS = prevDelay;
+        if (prevOut === undefined) delete process.env.FAKE_AGY_MODELS_OUT;
+        else process.env.FAKE_AGY_MODELS_OUT = prevOut;
+        cleanDir(dir);
+      }
+    });
+  });
+
+  describe('Windows .cmd wrapper safety check', () => {
+    it('strict static command allowlist allows only exact tuples', () => {
+      // Allowed tuples
+      const wrapModels = wrapWindowsCmd('C:\\tools\\agy.cmd', ['models']);
+      assert.equal(wrapModels.isCmd, true);
+      assert.ok(wrapModels.args[3].includes('models'));
+
+      const wrapAcp = wrapWindowsCmd('C:\\tools\\agy.cmd', ['acp', '--stdio']);
+      assert.equal(wrapAcp.isCmd, true);
+
+      const wrapAcpSandbox = wrapWindowsCmd('C:\\tools\\agy.cmd', ['acp', '--stdio', '--sandbox']);
+      assert.equal(wrapAcpSandbox.isCmd, true);
+
+      // Disallowed tuples must throw
+      assert.throws(() => wrapWindowsCmd('C:\\tools\\agy.cmd', ['models', '--extra']), /Argumen ACP tidak valid/);
+      assert.throws(() => wrapWindowsCmd('C:\\tools\\agy.cmd', ['calc']), /Argumen ACP tidak valid/);
+      assert.throws(() => wrapWindowsCmd('C:\\tools\\agy.cmd', ['acp']), /Argumen ACP tidak valid/);
+      assert.throws(() => wrapWindowsCmd('C:\\tools\\agy.cmd', []), /Argumen ACP tidak valid/);
+      assert.throws(() => wrapWindowsCmd('C:\\tools\\agy&calc.cmd', ['models']), /karakter tidak aman/);
+    });
+
+    if (process.platform === 'win32') {
+      it('executes models via .cmd wrapper script on win32', async () => {
+        const dir = makeTempDir('kantor-acp-cmd-models-');
+        const cmdPath = path.join(dir, 'agy wrapper.cmd');
+        fs.writeFileSync(cmdPath, `@echo off\r\n"${process.execPath}" "${FAKE_AGY}" %*\r\n`, 'utf8');
+
+        const bridge = new AcpBridge({
+          projectDir: dir,
+          agyBin: cmdPath,
+        });
+
+        try {
+          const res = await bridge.listModels();
+          assert.equal(res.ok, true);
+          assert.equal(res.source, 'agy-models');
+          assert.ok(res.models.length >= 2);
+        } finally {
+          cleanDir(dir);
+        }
+      });
     }
   });
 });

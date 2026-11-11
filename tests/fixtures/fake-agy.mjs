@@ -6,11 +6,6 @@ const hasAcp = args.includes('acp');
 const hasStdio = args.includes('--stdio');
 const hasSandbox = args.includes('--sandbox');
 
-if (!hasAcp || !hasStdio) {
-  process.stderr.write(`fake-agy: expected "acp --stdio", got ${JSON.stringify(args)}\n`);
-  process.exit(2);
-}
-
 if (process.env.FAKE_AGY_LOG_FILE) {
   try {
     fs.appendFileSync(
@@ -19,6 +14,40 @@ if (process.env.FAKE_AGY_LOG_FILE) {
       'utf8'
     );
   } catch {}
+}
+
+if (args[0] === 'models') {
+  const delayMs = Number(process.env.FAKE_AGY_MODELS_DELAY_MS || 0);
+  const exitCode = Number(process.env.FAKE_AGY_MODELS_EXIT ?? 0);
+  const defaultModelsOut = [
+    'gemini-2.5-pro\tGemini 2.5 Pro',
+    'gemini-2.5-flash\tGemini 2.5 Flash',
+    'claude-3-7-sonnet\tClaude 3.7 Sonnet',
+  ].join('\n') + '\n';
+  const modelsOut = process.env.FAKE_AGY_MODELS_OUT !== undefined
+    ? process.env.FAKE_AGY_MODELS_OUT
+    : defaultModelsOut;
+
+  const run = () => {
+    if (process.env.FAKE_AGY_MODELS_NO_STDERR !== '1') {
+      process.stderr.write('Fetching available models...\n');
+    }
+    if (exitCode === 0) {
+      process.stdout.write(modelsOut);
+    } else {
+      process.stderr.write('Error fetching models\n');
+    }
+    process.exit(exitCode);
+  };
+
+  if (delayMs > 0) {
+    setTimeout(run, delayMs);
+  } else {
+    run();
+  }
+} else if (!hasAcp || !hasStdio) {
+  process.stderr.write(`fake-agy: expected "acp --stdio", got ${JSON.stringify(args)}\n`);
+  process.exit(2);
 }
 
 function send(msg) {
@@ -441,37 +470,39 @@ function handleMessage(msg) {
   }
 }
 
-const decoder = new StringDecoder('utf8');
-let buf = '';
-process.stdin.on('data', (chunk) => {
-  buf += decoder.write(chunk);
-  let idx;
-  while ((idx = buf.indexOf('\n')) !== -1) {
-    let line = buf.slice(0, idx);
-    buf = buf.slice(idx + 1);
-    if (line.endsWith('\r')) line = line.slice(0, -1);
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    try {
-      handleMessage(JSON.parse(trimmed));
-    } catch {}
-  }
-});
+if (args[0] !== 'models') {
+  const decoder = new StringDecoder('utf8');
+  let buf = '';
+  process.stdin.on('data', (chunk) => {
+    buf += decoder.write(chunk);
+    let idx;
+    while ((idx = buf.indexOf('\n')) !== -1) {
+      let line = buf.slice(0, idx);
+      buf = buf.slice(idx + 1);
+      if (line.endsWith('\r')) line = line.slice(0, -1);
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        handleMessage(JSON.parse(trimmed));
+      } catch {}
+    }
+  });
 
-process.stdin.on('end', () => {
-  const rest = (buf + decoder.end()).trim();
-  if (rest) {
-    try {
-      handleMessage(JSON.parse(rest));
-    } catch {}
-  }
-  if (process.env.FAKE_AGY_IGNORE_EOF === '1') {
-    setInterval(() => {}, 1000);
-    return;
-  }
-  setTimeout(() => process.exit(0), 20).unref();
-});
+  process.stdin.on('end', () => {
+    const rest = (buf + decoder.end()).trim();
+    if (rest) {
+      try {
+        handleMessage(JSON.parse(rest));
+      } catch {}
+    }
+    if (process.env.FAKE_AGY_IGNORE_EOF === '1') {
+      setInterval(() => {}, 1000);
+      return;
+    }
+    setTimeout(() => process.exit(0), 20).unref();
+  });
 
-process.on('SIGTERM', () => {
-  process.exit(0);
-});
+  process.on('SIGTERM', () => {
+    process.exit(0);
+  });
+}

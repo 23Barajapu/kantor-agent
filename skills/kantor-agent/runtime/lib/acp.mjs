@@ -4,13 +4,83 @@ import { StringDecoder } from 'node:string_decoder';
 import { isFile, isPlainObj, isoMs } from './util.mjs';
 
 const VALID_MODES = new Set(['plan', 'accept-edits', 'auto']);
-const ALLOWED_STATIC_ACP_ARGS = new Set(['acp', '--stdio', '--sandbox']);
+const ALLOWED_STATIC_COMMAND_TUPLES = [
+  ['models'],
+  ['acp', '--stdio'],
+  ['acp', '--stdio', '--sandbox'],
+];
 const CMD_UNSAFE_RE = /[\x00-\x1f\x7f"&|<>^%!;=]/;
 const MAX_HISTORY = 200;
 const MAX_STDOUT_LINE_BYTES = 4 * 1024 * 1024;
 const DEFAULT_RPC_TIMEOUT_MS = 30_000;
 const SSE_HEARTBEAT_MS = 20_000;
 const SHUTDOWN_KILL_WAIT_MS = 400;
+const MAX_PARSED_MODELS = 200;
+const MAX_MODEL_ID_LEN = 160;
+const MAX_MODEL_NAME_LEN = 200;
+
+function isAllowedCommandTuple(args) {
+  if (!Array.isArray(args)) return false;
+  return ALLOWED_STATIC_COMMAND_TUPLES.some((tuple) =>
+    tuple.length === args.length && tuple.every((val, idx) => val === args[idx])
+  );
+}
+
+export function parseModelsOutput(stdout) {
+  if (typeof stdout !== 'string' || !stdout) {
+    return [];
+  }
+  const lines = stdout.split(/\r?\n/);
+  const models = [];
+  const seenIds = new Set();
+
+  for (const rawLine of lines) {
+    const tabIdx = rawLine.indexOf('\t');
+    if (tabIdx === -1) {
+      continue;
+    }
+    const rawId = rawLine.slice(0, tabIdx).trim();
+    let rawName = rawLine.slice(tabIdx + 1).trim();
+    if (!rawName) {
+      rawName = rawId;
+    }
+    if (!rawId || rawId.length > MAX_MODEL_ID_LEN || rawName.length > MAX_MODEL_NAME_LEN) {
+      continue;
+    }
+    if (seenIds.has(rawId)) {
+      continue;
+    }
+    seenIds.add(rawId);
+    models.push({ id: rawId, name: rawName });
+    if (models.length >= MAX_PARSED_MODELS) {
+      break;
+    }
+  }
+
+  return models;
+}
+
+function killProcessTree(child, isCmd = false) {
+  if (!child || child.killed || child.exitCode !== null || child.signalCode !== null) return;
+  if (process.platform === 'win32' && isCmd && child.pid) {
+    try {
+      const killer = spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], {
+        windowsHide: true,
+        stdio: 'ignore',
+      });
+      killer.unref?.();
+      killer.once('error', () => {
+        try { child.kill('SIGKILL'); } catch {}
+      });
+    } catch {
+      try { child.kill('SIGKILL'); } catch {}
+    }
+  } else {
+    try {
+      child.kill('SIGKILL');
+    } catch {}
+  }
+}
 
 function httpError(status, message, { publicSafe = false } = {}) {
   return Object.assign(new Error(message), { status, ...(publicSafe ? { publicSafe: true } : {}) });
@@ -89,12 +159,12 @@ function resolveWindowsBinary(agyBin) {
   return { kind: 'direct', bin: raw };
 }
 
-function wrapWindowsCmd(binPath, acpArgs) {
+export function wrapWindowsCmd(binPath, acpArgs) {
   const cleanBin = String(binPath || '').trim();
   if (!cleanBin || CMD_UNSAFE_RE.test(cleanBin)) {
     throw new Error('Path biner ACP mengandung karakter tidak aman untuk cmd.exe');
   }
-  if (!Array.isArray(acpArgs) || !acpArgs.every((arg) => ALLOWED_STATIC_ACP_ARGS.has(arg))) {
+  if (!isAllowedCommandTuple(acpArgs)) {
     throw new Error('Argumen ACP tidak valid untuk eksekusi cmd.exe');
   }
   const comSpec = process.env.ComSpec || 'cmd.exe';
@@ -120,6 +190,8 @@ export class AcpBridge {
     isCliSession = null,
     permissionTimeoutMs = 120_000,
     rpcTimeoutMs = DEFAULT_RPC_TIMEOUT_MS,
+    modelsTimeoutMs = 15_000,
+    modelsCacheTtlMs = 300_000,
   } = {}) {
     this.projectDir =
       typeof projectDir === 'string' && projectDir.trim() !== '' ? projectDir : process.cwd();
@@ -145,6 +217,12 @@ export class AcpBridge {
         : 120_000;
     this.rpcTimeoutMs =
       Number.isFinite(rpcTimeoutMs) && rpcTimeoutMs > 0 ? rpcTimeoutMs : DEFAULT_RPC_TIMEOUT_MS;
+    this.modelsTimeoutMs =
+      Number.isFinite(modelsTimeoutMs) && modelsTimeoutMs > 0 ? modelsTimeoutMs : 15_000;
+    this.modelsCacheTtlMs =
+      Number.isFinite(modelsCacheTtlMs) && modelsCacheTtlMs > 0 ? modelsCacheTtlMs : 300_000;
+    this._modelsCache = null;
+    this._modelsPromise = null;
 
     this.connected = false;
     this.busy = false;
@@ -1497,5 +1575,280 @@ export class AcpBridge {
     })();
 
     return this._shutdownPromise;
+  }
+
+  _resolveModelsSpawnSpec() {
+    const modelsArgs = ['models'];
+    const lowerBin = this.agyBin.toLowerCase();
+    if (lowerBin.endsWith('.mjs') || lowerBin.endsWith('.js')) {
+      return {
+        cmd: process.execPath,
+        args: [this.agyBin, ...modelsArgs],
+        options: {
+          cwd: this.projectDir,
+          windowsHide: true,
+          shell: false,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        },
+        isCmd: false,
+      };
+    }
+
+    if (process.platform === 'win32') {
+      const resolved = resolveWindowsBinary(this.agyBin);
+      if (resolved.kind === 'node') {
+        return {
+          cmd: process.execPath,
+          args: [resolved.bin, ...modelsArgs],
+          options: {
+            cwd: this.projectDir,
+            windowsHide: true,
+            shell: false,
+            stdio: ['ignore', 'pipe', 'pipe'],
+          },
+          isCmd: false,
+        };
+      }
+      if (resolved.kind === 'cmd') {
+        const wrapped = wrapWindowsCmd(resolved.bin, modelsArgs);
+        return {
+          cmd: wrapped.cmd,
+          args: wrapped.args,
+          options: {
+            cwd: this.projectDir,
+            windowsHide: true,
+            windowsVerbatimArguments: true,
+            shell: false,
+            stdio: ['ignore', 'pipe', 'pipe'],
+          },
+          isCmd: true,
+        };
+      }
+      return {
+        cmd: resolved.bin,
+        args: modelsArgs,
+        options: {
+          cwd: this.projectDir,
+          windowsHide: true,
+          shell: false,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        },
+        isCmd: false,
+      };
+    }
+
+    return {
+      cmd: this.agyBin,
+      args: modelsArgs,
+      options: {
+        cwd: this.projectDir,
+        windowsHide: true,
+        shell: false,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+      isCmd: false,
+    };
+  }
+
+  _sanitizeModelsError(err, exitCode = null, signal = null) {
+    if (err?.code === 'ENOENT') {
+      return 'Biner agy tidak ditemukan';
+    }
+    if (err) {
+      return 'Gagal menjalankan proses agy models';
+    }
+    if (exitCode !== null && exitCode !== 0) {
+      return `Proses agy models berhenti (exit ${exitCode})`;
+    }
+    if (signal !== null) {
+      return `Proses agy models berhenti (signal ${signal})`;
+    }
+    return 'Daftar model kosong dari agy models';
+  }
+
+  async _fetchModels() {
+    let spec;
+    try {
+      spec = this._resolveModelsSpawnSpec();
+    } catch {
+      const safeError = 'Konfigurasi biner agy models tidak valid';
+      if (this._modelsCache && Array.isArray(this._modelsCache.models) && this._modelsCache.models.length > 0) {
+        return {
+          ok: true,
+          models: [...this._modelsCache.models],
+          source: 'cache-stale',
+          cached: true,
+          degraded: true,
+          error: safeError,
+        };
+      }
+      return {
+        ok: false,
+        models: [],
+        source: 'error',
+        cached: false,
+        degraded: true,
+        error: safeError,
+      };
+    }
+
+    const MAX_STDOUT_BYTES = 512 * 1024;
+
+    return new Promise((resolve) => {
+      let child;
+      try {
+        child = spawn(spec.cmd, spec.args, spec.options);
+      } catch (spawnErr) {
+        const safeError = this._sanitizeModelsError(spawnErr);
+        if (this._modelsCache && Array.isArray(this._modelsCache.models) && this._modelsCache.models.length > 0) {
+          resolve({
+            ok: true,
+            models: [...this._modelsCache.models],
+            source: 'cache-stale',
+            cached: true,
+            degraded: true,
+            error: safeError,
+          });
+        } else {
+          resolve({
+            ok: false,
+            models: [],
+            source: 'error',
+            cached: false,
+            degraded: true,
+            error: safeError,
+          });
+        }
+        return;
+      }
+
+      let timer = null;
+      let timedOut = false;
+      let stdoutExceeded = false;
+      let stdoutBytes = 0;
+      let stdoutBuffer = '';
+      let settled = false;
+      const decoder = new StringDecoder('utf8');
+
+      const cleanup = () => {
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+      };
+
+      if (Number.isFinite(this.modelsTimeoutMs) && this.modelsTimeoutMs > 0) {
+        timer = setTimeout(() => {
+          timedOut = true;
+          killProcessTree(child, spec.isCmd);
+        }, this.modelsTimeoutMs);
+        timer.unref?.();
+      }
+
+      child.stdout?.on('data', (chunk) => {
+        stdoutBytes += chunk.length;
+        if (stdoutBytes > MAX_STDOUT_BYTES) {
+          stdoutExceeded = true;
+          killProcessTree(child, spec.isCmd);
+          return;
+        }
+        stdoutBuffer += decoder.write(chunk);
+      });
+
+      child.stderr?.on('data', () => {});
+
+      const finish = (code, signal, err = null) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        stdoutBuffer += decoder.end();
+
+        let safeError = null;
+        if (timedOut) {
+          safeError = 'Batas waktu eksekusi agy models terlampaui';
+        } else if (stdoutExceeded) {
+          safeError = 'Output agy models melebihi batas 512 KB';
+        } else if (err) {
+          safeError = this._sanitizeModelsError(err);
+        } else if (code !== 0 || signal !== null) {
+          safeError = this._sanitizeModelsError(null, code, signal);
+        }
+
+        if (!safeError) {
+          const models = parseModelsOutput(stdoutBuffer);
+          if (models.length > 0) {
+            this._modelsCache = {
+              models,
+              fetchedAt: Date.now(),
+            };
+            resolve({
+              ok: true,
+              models,
+              source: 'agy-models',
+              cached: false,
+              degraded: false,
+              error: null,
+            });
+            return;
+          }
+          safeError = 'Daftar model kosong dari agy models';
+        }
+
+        if (this._modelsCache && Array.isArray(this._modelsCache.models) && this._modelsCache.models.length > 0) {
+          resolve({
+            ok: true,
+            models: [...this._modelsCache.models],
+            source: 'cache-stale',
+            cached: true,
+            degraded: true,
+            error: safeError,
+          });
+        } else {
+          resolve({
+            ok: false,
+            models: [],
+            source: 'error',
+            cached: false,
+            degraded: true,
+            error: safeError,
+          });
+        }
+      };
+
+      child.on('error', (err) => {
+        finish(null, null, err);
+      });
+
+      child.on('close', (code, signal) => {
+        finish(code, signal, null);
+      });
+    });
+  }
+
+  async listModels({ force = false } = {}) {
+    if (!force && this._modelsCache && (Date.now() - this._modelsCache.fetchedAt) < this.modelsCacheTtlMs) {
+      return {
+        ok: true,
+        models: [...this._modelsCache.models],
+        source: 'cache',
+        cached: true,
+        degraded: false,
+        error: null,
+      };
+    }
+
+    if (this._modelsPromise) {
+      return this._modelsPromise;
+    }
+
+    this._modelsPromise = (async () => {
+      try {
+        return await this._fetchModels();
+      } finally {
+        this._modelsPromise = null;
+      }
+    })();
+
+    return this._modelsPromise;
   }
 }
