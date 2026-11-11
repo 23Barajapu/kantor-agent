@@ -839,6 +839,84 @@ describe('AcpBridge (lib/acp.mjs)', () => {
       } finally {
         await bridgeLateClose.shutdown();
       }
+
+      // 10. Dead child1 (exitCode !== null before 'close') respawns child2 on sendPrompt() while preserving busy lock (409)
+      const bridgeRespawnBusy = new AcpBridge({ projectDir: dir, agyBin: FAKE_AGY });
+      try {
+        await bridgeRespawnBusy.createSession();
+        const oldRealChild = bridgeRespawnBusy.child;
+        // Buat deadChild1 yang sudah berstatus exitCode = 1 sementara 'close' belum tiba
+        const deadChild1 = new EventEmitter();
+        deadChild1.exitCode = 1;
+        deadChild1.signalCode = null;
+        deadChild1.stdin = { writable: true, destroyed: false, end() {}, on() {} };
+        bridgeRespawnBusy.child = deadChild1;
+        bridgeRespawnBusy._boundChild = deadChild1;
+        bridgeRespawnBusy.sessionId = 'dead-sess-before-close';
+        bridgeRespawnBusy.connected = true;
+
+        const sendP1 = bridgeRespawnBusy.sendPrompt('__TIMED_TURN__');
+        assert.equal(bridgeRespawnBusy.getStatus().busy, true);
+        await assert.rejects(() => bridgeRespawnBusy.sendPrompt('Konkuren saat respawn'), (err) => err?.status === 409);
+
+        const resP1 = await sendP1;
+        assert.equal(resP1.status, 202);
+        assert.equal(bridgeRespawnBusy.getStatus().busy, true);
+        assert.notEqual(bridgeRespawnBusy.child, deadChild1);
+        assert.notEqual(bridgeRespawnBusy.getStatus().sessionId, 'dead-sess-before-close');
+        await assert.rejects(() => bridgeRespawnBusy.sendPrompt('Konkuren saat turn aktif'), (err) => err?.status === 409);
+
+        const timedRes = await bridgeRespawnBusy.waitForTurn();
+        assert.equal(timedRes.ok, true);
+        assert.equal(bridgeRespawnBusy.getStatus().busy, false);
+
+        // Bersihkan oldRealChild yang sempat dilepas
+        try {
+          oldRealChild?.stdin?.end();
+          oldRealChild?.kill('SIGTERM');
+        } catch {}
+      } finally {
+        await bridgeRespawnBusy.shutdown();
+      }
+
+      // 11. Windows .cmd tree termination via taskkill /T /F kills grandchild node.exe even when EOF is ignored (win32 only)
+      if (process.platform === 'win32') {
+        const cmdTreeLog = path.join(dir, 'cmd-tree.log');
+        const prevLogTree = process.env.FAKE_AGY_LOG_FILE;
+        const prevIgnoreEof = process.env.FAKE_AGY_IGNORE_EOF;
+        process.env.FAKE_AGY_LOG_FILE = cmdTreeLog;
+        process.env.FAKE_AGY_IGNORE_EOF = '1';
+
+        const cmdHangPath = path.join(dir, 'agy hang wrapper.cmd');
+        fs.writeFileSync(cmdHangPath, `@echo off\r\n"${process.execPath}" "${FAKE_AGY}" %*\r\n`, 'utf8');
+        const bridgeCmdTree = new AcpBridge({
+          projectDir: dir,
+          agyBin: cmdHangPath,
+        });
+        try {
+          await bridgeCmdTree.sendPrompt('__SLOW_TURN__');
+          const logEntry = JSON.parse(fs.readFileSync(cmdTreeLog, 'utf8').trim().split('\n')[0]);
+          const grandchildPid = logEntry.pid;
+          assert.ok(Number.isInteger(grandchildPid));
+
+          await bridgeCmdTree.shutdown();
+          // Tunggu sejenak agar OS membersihkan tabel proses setelah taskkill /T /F
+          await new Promise((r) => setTimeout(r, 150));
+          let stillAlive = true;
+          try {
+            process.kill(grandchildPid, 0);
+          } catch (err) {
+            if (err?.code === 'ESRCH') stillAlive = false;
+          }
+          assert.equal(stillAlive, false, `Grandchild node PID ${grandchildPid} wajib mati oleh taskkill /T /F`);
+        } finally {
+          await bridgeCmdTree.shutdown();
+          if (prevLogTree === undefined) delete process.env.FAKE_AGY_LOG_FILE;
+          else process.env.FAKE_AGY_LOG_FILE = prevLogTree;
+          if (prevIgnoreEof === undefined) delete process.env.FAKE_AGY_IGNORE_EOF;
+          else process.env.FAKE_AGY_IGNORE_EOF = prevIgnoreEof;
+        }
+      }
     } finally {
       if (prevRpcLog === undefined) delete process.env.FAKE_AGY_RPC_LOG;
       else process.env.FAKE_AGY_RPC_LOG = prevRpcLog;

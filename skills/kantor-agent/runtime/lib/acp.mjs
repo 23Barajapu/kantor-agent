@@ -152,6 +152,8 @@ export class AcpBridge {
     this.shuttingDown = false;
     this._sessionBusy = false;
     this._turnEpoch = 0;
+    this._nextTurnId = 1;
+    this._activeTurnId = 0;
     this.sessionId = null;
     this.mode = this.defaultMode;
     this.model = this.defaultModel;
@@ -725,6 +727,7 @@ export class AcpBridge {
     this._spawnedViaCmd = false;
     this.connected = false;
     this.busy = false;
+    this._activeTurnId = 0;
     this.sessionId = null;
     this._initResult = null;
 
@@ -751,7 +754,6 @@ export class AcpBridge {
       this._boundChild = null;
       this._spawnedViaCmd = false;
       this.connected = false;
-      this.busy = false;
       this.sessionId = null;
       this._initResult = null;
       this._failAllPending(new Error('Proses ACP sebelumnya telah berhenti'), {
@@ -840,19 +842,43 @@ export class AcpBridge {
       this._spawnedViaCmd = false;
       this.connected = false;
       this.busy = false;
+      this._activeTurnId = 0;
       this.sessionId = null;
       return;
     }
 
     const isCmdChild = process.platform === 'win32' && Boolean(child._viaCmd || this._spawnedViaCmd);
     const killCmdTree = () => {
-      if (isCmdChild && Number.isInteger(child.pid)) {
+      if (!isCmdChild || !Number.isInteger(child.pid)) {
+        try {
+          if (child.exitCode === null && child.signalCode === null) {
+            child.kill('SIGKILL');
+          }
+        } catch {}
+        return;
+      }
+
+      let sigkillDone = false;
+      const fallbackSigkill = () => {
+        if (sigkillDone) return;
+        sigkillDone = true;
+        try {
+          if (child.exitCode === null && child.signalCode === null) {
+            child.kill('SIGKILL');
+          }
+        } catch {}
+      };
+
+      try {
         const killer = spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], {
           windowsHide: true,
           stdio: 'ignore',
         });
-        killer.on('error', () => {});
+        killer.once('error', fallbackSigkill);
+        killer.once('exit', fallbackSigkill);
         killer.unref();
+      } catch {
+        fallbackSigkill();
       }
     };
 
@@ -866,6 +892,7 @@ export class AcpBridge {
       }
       this.connected = false;
       this.busy = false;
+      this._activeTurnId = 0;
       return;
     }
 
@@ -889,6 +916,7 @@ export class AcpBridge {
         }
         this.connected = false;
         this.busy = false;
+        this._activeTurnId = 0;
         resolve();
       };
 
@@ -911,14 +939,11 @@ export class AcpBridge {
       killTimer = setTimeout(() => {
         try {
           killCmdTree();
-          if (child.exitCode === null && child.signalCode === null) {
-            child.kill('SIGKILL');
-          }
         } catch {}
       }, SHUTDOWN_KILL_WAIT_MS);
       killTimer.unref?.();
 
-      hardTimer = setTimeout(finish, SHUTDOWN_KILL_WAIT_MS + 300);
+      hardTimer = setTimeout(finish, SHUTDOWN_KILL_WAIT_MS + 800);
       hardTimer.unref?.();
     });
   }
@@ -1198,6 +1223,8 @@ export class AcpBridge {
 
     const text = rawText.trim();
     const turnEpoch = this._turnEpoch;
+    const myTurnId = this._nextTurnId++;
+    this._activeTurnId = myTurnId;
     this.busy = true;
     this.lastError = null;
 
@@ -1215,8 +1242,11 @@ export class AcpBridge {
       }
 
       if (this.shuttingDown || turnEpoch !== this._turnEpoch) {
-        this.busy = false;
-        this._turnPromise = null;
+        if (this._activeTurnId === myTurnId) {
+          this.busy = false;
+          this._activeTurnId = 0;
+          this._turnPromise = null;
+        }
         if (this.shuttingDown) {
           throw Object.assign(httpError(503, 'Jembatan ACP sedang dimatikan', { publicSafe: true }), {
             _cancelledMidStartup: true,
@@ -1249,9 +1279,12 @@ export class AcpBridge {
 
       this._turnPromise = rpcPromise.then(
         (result) => {
-          this._finalizeStreamingAssistant();
-          this.busy = false;
-          this._turnPromise = null;
+          if (this._activeTurnId === myTurnId) {
+            this._finalizeStreamingAssistant();
+            this.busy = false;
+            this._activeTurnId = 0;
+            this._turnPromise = null;
+          }
           const stopReason = result?.stopReason || 'end_turn';
           this._broadcastSse('turn_done', {
             sessionId: activeSessionId,
@@ -1263,9 +1296,12 @@ export class AcpBridge {
           return { ok: true, result: result ?? {} };
         },
         (err) => {
-          this._finalizeStreamingAssistant();
-          this.busy = false;
-          this._turnPromise = null;
+          if (this._activeTurnId === myTurnId) {
+            this._finalizeStreamingAssistant();
+            this.busy = false;
+            this._activeTurnId = 0;
+            this._turnPromise = null;
+          }
           const errMsg = err?.message || 'Giliran ACP gagal';
           if (!this.shuttingDown) {
             this.lastError = errMsg;
@@ -1294,8 +1330,11 @@ export class AcpBridge {
         },
       };
     } catch (err) {
-      this.busy = false;
-      this._turnPromise = null;
+      if (this._activeTurnId === myTurnId) {
+        this.busy = false;
+        this._activeTurnId = 0;
+        this._turnPromise = null;
+      }
       const wasCancelled =
         Boolean(err?._cancelledMidStartup) || this.shuttingDown || turnEpoch !== this._turnEpoch;
       if (!wasCancelled) {

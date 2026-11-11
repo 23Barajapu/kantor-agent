@@ -465,6 +465,10 @@ process.stdin.on('end', () => {
       handleMessage(JSON.parse(rest));
     } catch {}
   }
+  if (process.env.FAKE_AGY_IGNORE_EOF === '1') {
+    setInterval(() => {}, 1000);
+    return;
+  }
   setTimeout(() => process.exit(0), 20).unref();
 });
 
