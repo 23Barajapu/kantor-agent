@@ -3,6 +3,12 @@
   "displayName": "Kantor Agent",
   "version": "1.0.0",
   "description": "Kantor 3D real-time agent monitoring and interactive ACP chat for Antigravity",
+  "logo": "assets/logo.svg",
+  "author": {
+    "name": "Schwarz"
+  },
+  "homepage": "https://github.com/23Barajapu/kantor-agent",
+  "repository": "https://github.com/23Barajapu/kantor-agent",
   "license": "MIT",
   "keywords": [
     "antigravity",

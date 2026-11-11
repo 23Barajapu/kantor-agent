@@ -4,6 +4,8 @@ Saat plugin `kantor-agent` aktif, **Joko** (*Lead Architect*) bertindak sebagai 
 
 ## 1. Matriks 4 Divisi Tim IT & Skill Terpasang
 
+Daftar skill Antigravity di bawah adalah rekomendasi opsional saat terpasang di `~/.gemini/config/skills/` atau plugin workspace; bila belum terpasang, lanjutkan pekerjaan dengan disiplin rekayasa standar.
+
 | Meja | Karakter | `TypeName` | Skill Antigravity yang Dipetakan |
 |---|---|---|---|
 | **Frontend & UI** | **Budi** | `frontend-ui-dev` | `frontend-ui-engineering`, `antislop-ui`, `antislop-human`, `antislop-layoutmobile`, `emil-design-eng`, `apple-design`, `animate`, `animate-expo`, `animation-performance`, `find-animation-opportunities`, `improve-animations`, `review-animations`, `pick-ui-library`, `ask-sonner`, `break-ui`, `a11y-debugging`, `mobile-native`, `figma-*`, `canva-*`, `remotion-*`, `generative_ui` |

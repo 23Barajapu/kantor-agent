@@ -1,7 +1,8 @@
 # Third-party notices
 
-This Antigravity plugin edition is an adaptation of Kantor Agent (https://github.com/humaedihume/kantor-agent),
-copyright (c) 2026 humaedihume, licensed under the MIT License.
+This Antigravity plugin edition is maintained by Schwarz (https://github.com/23Barajapu/kantor-agent)
+as an adaptation of Kantor Agent (https://github.com/humaedihume/kantor-agent),
+copyright (c) 2026 humaedihume and copyright (c) 2026 Schwarz, licensed under the MIT License.
 
 Kantor Agent bundles (vendors) a copy of the following third-party software under
 `skills/kantor-agent/runtime/public/assets/vendor/three/`. It remains under its own license, reproduced in full below
@@ -16,7 +17,7 @@ No fonts, analytics, or other remote resources are loaded at runtime; the page u
 
 ---
 
-## three.js r170 — MIT
+## three.js r170 - MIT
 
 The MIT License
 

@@ -1,0 +1,31 @@
+{
+  "name": "kantor-agent",
+  "version": "1.0.0",
+  "description": "Kantor 3D real-time agent monitoring and interactive ACP chat for Antigravity",
+  "private": false,
+  "type": "module",
+  "license": "MIT",
+  "author": "Schwarz",
+  "homepage": "https://github.com/23Barajapu/kantor-agent",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/23Barajapu/kantor-agent.git"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "detect": "node skills/kantor-agent/runtime/bin/kantor.mjs detect",
+    "check": "node skills/kantor-agent/runtime/bin/check.mjs"
+  },
+  "keywords": [
+    "antigravity",
+    "monitoring",
+    "subagents",
+    "office",
+    "chat",
+    "acp",
+    "threejs"
+  ]
+}

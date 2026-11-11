@@ -16,6 +16,14 @@ const AGENTS_RESOURCES_DIR = path.join(WORKTREE_ROOT, 'skills', 'kantor-agent', 
 const RULES_AGENTS_PATH = path.join(WORKTREE_ROOT, 'rules', 'AGENTS.md');
 const SKILL_MD_PATH = path.join(WORKTREE_ROOT, 'skills', 'kantor-agent', 'SKILL.md');
 const README_PATH = path.join(WORKTREE_ROOT, 'README.md');
+const LICENSE_PATH = path.join(WORKTREE_ROOT, 'LICENSE');
+const THIRD_PARTY_PATH = path.join(WORKTREE_ROOT, 'THIRD_PARTY_NOTICES.md');
+const PLUGIN_JSON_PATH = path.join(WORKTREE_ROOT, 'plugin.json');
+const PACKAGE_JSON_PATH = path.join(WORKTREE_ROOT, 'package.json');
+const LOGO_PATH = path.join(WORKTREE_ROOT, 'assets', 'logo.svg');
+const CI_WORKFLOW_PATH = path.join(WORKTREE_ROOT, '.github', 'workflows', 'ci.yml');
+const CONTRIBUTING_PATH = path.join(WORKTREE_ROOT, 'CONTRIBUTING.md');
+const SECURITY_PATH = path.join(WORKTREE_ROOT, 'SECURITY.md');
 
 const EXPECTED_AGENT_FILES = [
   'backend-architect.md',
@@ -959,6 +967,68 @@ describe('Task 9: rules/AGENTS.md, IT specialist templates, setupTeam, and CLI l
     } finally {
       killPidBestEffort(dummy.pid);
       cleanDir(tmpRoot);
+    }
+  });
+
+  it('Task 4: Open-source metadata, packaging, CI workflows, and portable agent rules', () => {
+    // 1. LICENSE & THIRD_PARTY_NOTICES.md
+    assert.ok(fs.existsSync(LICENSE_PATH), 'LICENSE must exist');
+    const licenseText = fs.readFileSync(LICENSE_PATH, 'utf8');
+    assert.ok(licenseText.includes('humaedihume'), 'LICENSE must retain humaedihume copyright');
+    assert.ok(licenseText.includes('Schwarz'), 'LICENSE must include Schwarz copyright');
+
+    assert.ok(fs.existsSync(THIRD_PARTY_PATH), 'THIRD_PARTY_NOTICES.md must exist');
+    const thirdPartyText = fs.readFileSync(THIRD_PARTY_PATH, 'utf8');
+    assert.ok(thirdPartyText.includes('Schwarz'), 'THIRD_PARTY_NOTICES.md must mention Schwarz');
+    assert.ok(thirdPartyText.includes('humaedihume'), 'THIRD_PARTY_NOTICES.md must mention humaedihume');
+
+    // 2. plugin.json metadata and logo asset
+    assert.ok(fs.existsSync(PLUGIN_JSON_PATH), 'plugin.json must exist');
+    const pluginMeta = JSON.parse(fs.readFileSync(PLUGIN_JSON_PATH, 'utf8'));
+    assert.ok(pluginMeta.author, 'plugin.json must have author field');
+    assert.equal(pluginMeta.repository, 'https://github.com/23Barajapu/kantor-agent');
+    assert.equal(pluginMeta.homepage, 'https://github.com/23Barajapu/kantor-agent');
+    assert.equal(pluginMeta.logo, 'assets/logo.svg');
+
+    assert.ok(fs.existsSync(LOGO_PATH), 'assets/logo.svg must exist');
+    const logoSvg = fs.readFileSync(LOGO_PATH, 'utf8');
+    assert.ok(logoSvg.includes('<svg') && logoSvg.includes('</svg>'), 'assets/logo.svg must contain valid SVG markup');
+    assert.ok(logoSvg.includes('viewBox="0 0 128 128"'), 'assets/logo.svg must have 128x128 viewBox');
+
+    // 3. package.json zero-dependency packaging contract
+    assert.ok(fs.existsSync(PACKAGE_JSON_PATH), 'package.json must exist');
+    const pkg = JSON.parse(fs.readFileSync(PACKAGE_JSON_PATH, 'utf8'));
+    assert.equal(pkg.type, 'module');
+    assert.equal(pkg.license, 'MIT');
+    assert.ok(pkg.engines && typeof pkg.engines.node === 'string' && pkg.engines.node.includes('>=22.5'));
+    assert.ok(pkg.scripts && typeof pkg.scripts.test === 'string' && pkg.scripts.test.includes('node --test'));
+    assert.equal(pkg.dependencies, undefined, 'package.json must not include runtime dependencies');
+    assert.equal(pkg.devDependencies, undefined, 'package.json must not include devDependencies');
+
+    // 4. CI workflow, CONTRIBUTING.md, and SECURITY.md
+    assert.ok(fs.existsSync(CI_WORKFLOW_PATH), '.github/workflows/ci.yml must exist');
+    const ciContent = fs.readFileSync(CI_WORKFLOW_PATH, 'utf8');
+    assert.ok(ciContent.includes('actions/checkout@v4'));
+    assert.ok(ciContent.includes('actions/setup-node@v4'));
+    assert.ok(ciContent.includes('npm test'));
+
+    assert.ok(fs.existsSync(CONTRIBUTING_PATH), 'CONTRIBUTING.md must exist');
+    assert.ok(fs.existsSync(SECURITY_PATH), 'SECURITY.md must exist');
+
+    // 5. Portable skill wording in rules/AGENTS.md and agent templates
+    const rulesText = fs.readFileSync(RULES_AGENTS_PATH, 'utf8');
+    assert.ok(
+      /opsional|optional/i.test(rulesText),
+      'rules/AGENTS.md must clarify that listed skills are optional recommended skills'
+    );
+
+    for (const specFile of EXPECTED_AGENT_FILES) {
+      const templatePath = path.join(AGENTS_RESOURCES_DIR, specFile);
+      const raw = fs.readFileSync(templatePath, 'utf8');
+      assert.ok(
+        /opsional|optional/i.test(raw),
+        `${specFile} must clarify that listed skills are optional recommended skills`
+      );
     }
   });
 });
