@@ -935,6 +935,115 @@ describe('office.mjs', () => {
         );
         assert.equal(s.ketua.state, 'santai');
         assert.equal(s.ketua.activity, null);
+
+        // 6. bekerja / aktif saat lastKind='tool' dalam main_active 90s tanpa subagent aktif maupun not_fully_idle
+        s = runCase(
+          'CASCADE_RUN_STATUS_IDLE',
+          0,
+          [
+            {
+              type: 'PLANNER_RESPONSE',
+              created_at: '2026-11-11T05:00:00Z',
+              step_index: 1,
+              status: 'DONE',
+              tool_calls: [{ name: 'read_file', args: { Path: path.join(env.projDir, 'a.js') } }],
+            },
+          ],
+          '2026-11-11T05:00:30Z'
+        );
+        assert.equal(s.ketua.state, 'bekerja');
+        assert.equal(s.ketua.activity, 'aktif');
+
+        // 7. bekerja / menunggu-tim saat lastKind='tool' (not_fully_idle=1) baik dalam 90s maupun 90s..900s
+        for (const nowIso of ['2026-11-11T05:00:30Z', '2026-11-11T05:05:00Z']) {
+          s = runCase(
+            'CASCADE_RUN_STATUS_IDLE',
+            1,
+            [
+              {
+                type: 'PLANNER_RESPONSE',
+                created_at: '2026-11-11T05:00:00Z',
+                step_index: 1,
+                status: 'DONE',
+                tool_calls: [{ name: 'invoke_subagent', args: { Role: 'FE', TypeName: 'frontend-ui-dev', Prompt: 'Kerjakan UI' } }],
+              },
+            ],
+            nowIso
+          );
+          assert.equal(s.ketua.state, 'bekerja');
+          assert.equal(s.ketua.activity, 'menunggu-tim');
+        }
+      } finally {
+        env.cleanup();
+      }
+    });
+
+    it("resolves Ketua activity to 'menunggu-tim' (not 'aktif' or 'alat') when lastKind === 'tool' right after invoke_subagent with active subagent", () => {
+      const env = makeEnv('kantor-off-wait-');
+      try {
+        const mainId = 'd2222222-2222-4222-8222-222222222221';
+        const subId = 'd2222222-2222-4222-8222-222222222222';
+
+        createDb(path.join(env.agHome, 'conversation_summaries.db'), [
+          {
+            conversation_id: mainId,
+            title: 'Delegasi Subagent',
+            last_modified_time: '2026-11-11T05:00:01Z',
+            workspace_uris: env.projUri,
+            status: 'CASCADE_RUN_STATUS_IDLE',
+            not_fully_idle: 0,
+            nesting_depth: 0,
+          },
+          {
+            conversation_id: subId,
+            title: 'Subagent Aktif',
+            last_modified_time: '2026-11-11T05:00:05Z',
+            workspace_uris: env.projUri,
+            status: 'CASCADE_RUN_STATUS_RUNNING',
+            parent_conversation_id: mainId,
+            nesting_depth: 1,
+          },
+        ]);
+
+        // Main memanggil invoke_subagent + GENERIC -> lastKind tetap 'tool'
+        writeJsonl(env.agHome, mainId, [
+          { type: 'USER_INPUT', created_at: '2026-11-11T05:00:00Z', step_index: 0 },
+          {
+            type: 'PLANNER_RESPONSE',
+            created_at: '2026-11-11T05:00:01Z',
+            step_index: 1,
+            status: 'DONE',
+            tool_calls: [
+              { name: 'invoke_subagent', args: { Role: 'Backend', TypeName: 'backend-architect', Prompt: 'Bangun API' } },
+            ],
+          },
+          {
+            type: 'GENERIC',
+            created_at: '2026-11-11T05:00:02Z',
+            step_index: 2,
+            status: 'DONE',
+            content: `Created the following subagent:\n{"conversationId":"${subId}"}`,
+          },
+        ]);
+
+        writeJsonl(env.agHome, subId, [
+          { type: 'USER_INPUT', created_at: '2026-11-11T05:00:03Z', step_index: 0 },
+        ]);
+
+        // Uji dalam jendela <= 90s (05:00:20Z) maupun 90s..900s (05:03:00Z): wajib 'menunggu-tim', bukan 'aktif' atau 'alat'
+        for (const nowIso of ['2026-11-11T05:00:20Z', '2026-11-11T05:03:00Z']) {
+          const state = withEnvHome(env.agHome, () =>
+            buildState({
+              projectDir: env.projDir,
+              storageDir: null,
+              cfg: env.cfg,
+              now: Date.parse(nowIso),
+            })
+          );
+          assert.equal(state.ketua.state, 'bekerja');
+          assert.equal(state.ketua.activity, 'menunggu-tim');
+          assert.equal(state.ketua.waiting_on, 1);
+        }
       } finally {
         env.cleanup();
       }

@@ -309,18 +309,17 @@ function resolveKetuaState(scanMains, runs, acpStatus, now, maMs, rwMs, cdMs) {
           : Number.POSITIVE_INFINITY;
     const activeKids = kids.get(m.id) ?? 0;
 
-    if (
-      (m.lastKind !== 'final' && age <= maMs) ||
-      m.status === 'CASCADE_RUN_STATUS_RUNNING' ||
-      isAcpBusySession(m)
-    ) {
+    if (m.status === 'CASCADE_RUN_STATUS_RUNNING' || isAcpBusySession(m)) {
+      return ['bekerja', 'aktif'];
+    }
+    if (activeKids > 0 || m.not_fully_idle === 1) {
+      return ['bekerja', 'menunggu-tim'];
+    }
+    if (m.lastKind !== 'final' && age <= maMs) {
       return ['bekerja', 'aktif'];
     }
     if (m.lastKind === 'tool' && age <= rwMs) {
       return ['bekerja', 'alat'];
-    }
-    if (activeKids > 0 || m.not_fully_idle === 1) {
-      return ['bekerja', 'menunggu-tim'];
     }
     if (m.lastKind === 'final' && age < cdMs) {
       return ['selesai', null];
