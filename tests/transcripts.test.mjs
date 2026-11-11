@@ -652,8 +652,15 @@ describe('transcripts.mjs (TranscriptScanner)', () => {
             {
               name: 'run_command',
               args: {
-                // Tanpa toolSummary → fallback hanya token executable pertama yang diredaksi, argumen tetap disembunyikan
+                // Tanpa toolSummary → fallback statis 'Jalankan perintah', CommandLine tidak pernah dibaca/dikeluarkan
                 CommandLine: 'psql postgres://admin:superpass@db.internal:5432/prod -c "SELECT 1"',
+              },
+            },
+            {
+              name: 'run_command',
+              args: {
+                // unquoteArg gagal JSON.parse pada string dengan kutipan internal → pertahankan kutip apa adanya
+                toolSummary: '"a" "b"',
               },
             },
             {
@@ -691,15 +698,17 @@ describe('transcripts.mjs (TranscriptScanner)', () => {
       const serialized = JSON.stringify(res);
 
       assert.ok(events.some((e) => e.tool === 'run_command' && e.text === 'Check API status'));
-      assert.ok(events.some((e) => e.tool === 'run_command' && e.text.includes('psql') && !e.text.includes('superpass')));
+      assert.ok(events.some((e) => e.tool === 'run_command' && e.text === 'Jalankan perintah'));
+      assert.ok(events.some((e) => e.tool === 'run_command' && e.text === '"a" "b"'));
       assert.ok(events.some((e) => e.tool === 'call_mcp_tool' && e.text.includes('github/list_issues')));
-      assert.ok(events.some((e) => e.tool === 'search_web' && e.text.includes('api key=•••') || e.text.includes('api_key=•••')));
+      assert.ok(events.some((e) => e.tool === 'search_web' && (e.text.includes('api key=•••') || e.text.includes('api_key=•••'))));
 
       for (const secret of [
         'Authorization',
         'Bearer',
         'secret123',
         'curl',
+        'psql',
         'superpass',
         'db.internal',
         'SELECT 1',
@@ -1035,6 +1044,329 @@ describe('transcripts.mjs (TranscriptScanner)', () => {
 
       assert.deepEqual(res.runs[0].segs, [['2026-11-11T05:00:00Z', null]]);
       assert.deepEqual(res.runs[0].resumes, ['2026-11-11T05:01:30Z']);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('never reduces prior accumulated tokens when a streaming step completes with 0 tokens', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kantor-tr-tok-zero-'));
+    try {
+      const agHome = path.join(tmpDir, 'antigravity');
+      const projDir = path.join(tmpDir, 'project');
+      fs.mkdirSync(projDir, { recursive: true });
+      const projUri = JSON.stringify([pathToFileURL(projDir).href]);
+      const nowSec = Math.floor(Date.parse('2026-11-11T06:00:00Z') / 1000);
+      const mainId = 'main-tok-zero';
+
+      createDb(path.join(agHome, 'conversation_summaries.db'), [
+        {
+          conversation_id: mainId,
+          title: 'Token Zero Edge',
+          last_modified_time: '2026-11-11T05:10:00Z',
+          workspace_uris: projUri,
+          nesting_depth: 0,
+        },
+      ]);
+
+      writeJsonl(agHome, mainId, [
+        {
+          type: 'PLANNER_RESPONSE',
+          created_at: '2026-11-11T05:00:00Z',
+          step_index: 1,
+          status: 'DONE',
+          input_tokens: 100,
+          output_tokens: 10,
+          cache_read_tokens: 0,
+          tool_calls: [{ name: 'list_dir', args: { DirectoryPath: projDir } }],
+        },
+        {
+          type: 'PLANNER_RESPONSE',
+          created_at: '2026-11-11T05:00:05Z',
+          step_index: 2,
+          status: 'RUNNING',
+          input_tokens: 50,
+          output_tokens: 20,
+          cache_read_tokens: 5,
+          tool_calls: [],
+        },
+        {
+          // Step 2 selesai/dibatalkan dengan angka token 0 pada created_at baru → tidak boleh mengurangi akumulasi sebelumnya
+          type: 'PLANNER_RESPONSE',
+          created_at: '2026-11-11T05:00:06Z',
+          step_index: 2,
+          status: 'DONE',
+          input_tokens: 0,
+          output_tokens: 0,
+          cache_read_tokens: 0,
+          content: 'Dibatalkan',
+          tool_calls: [],
+        },
+      ]);
+
+      const res = withEnvHome(agHome, () => {
+        const scanner = new TranscriptScanner(null, { window_days: 7, cooldown: 60 });
+        return scanner.scan(projDir, nowSec);
+      });
+
+      assert.equal(res.mains[0].tokens.input, 150);
+      assert.equal(res.mains[0].tokens.output, 30);
+      assert.equal(res.mains[0].tokens.cache_read, 5);
+      assert.equal(res.mains[0].tokens.total, 185);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('skips empty string arg keys in argStr and falls back to secondary keys', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kantor-tr-argstr-'));
+    try {
+      const agHome = path.join(tmpDir, 'antigravity');
+      const projDir = path.join(tmpDir, 'project');
+      fs.mkdirSync(projDir, { recursive: true });
+      const projUri = JSON.stringify([pathToFileURL(projDir).href]);
+      const nowSec = Math.floor(Date.parse('2026-11-11T06:00:00Z') / 1000);
+      const mainId = 'main-argstr';
+
+      createDb(path.join(agHome, 'conversation_summaries.db'), [
+        {
+          conversation_id: mainId,
+          title: 'ArgStr Fallback',
+          last_modified_time: '2026-11-11T05:10:00Z',
+          workspace_uris: projUri,
+          nesting_depth: 0,
+        },
+      ]);
+
+      writeJsonl(agHome, mainId, [
+        {
+          type: 'PLANNER_RESPONSE',
+          created_at: '2026-11-11T05:00:00Z',
+          step_index: 1,
+          status: 'DONE',
+          tool_calls: [
+            {
+              name: 'view_file',
+              args: { Path: '""', AbsolutePath: path.join(projDir, 'src', 'fallback.mjs') },
+            },
+            {
+              name: 'grep_search',
+              args: { Query: '   ', Pattern: 'handleAuth' },
+            },
+          ],
+        },
+      ]);
+
+      const res = withEnvHome(agHome, () => {
+        const scanner = new TranscriptScanner(null, { window_days: 7, cooldown: 60 });
+        return scanner.scan(projDir, nowSec);
+      });
+
+      const events = res.mains[0].events;
+      assert.ok(events.some((e) => e.tool === 'view_file' && e.text === 'Baca src/fallback.mjs'));
+      assert.ok(events.some((e) => e.tool === 'grep_search' && e.text === 'Cari: handleAuth'));
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('discards failed invoke_subagent from pendingSubagents and resets stale pending queue on USER_INPUT', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kantor-tr-fail-sub-'));
+    try {
+      const agHome = path.join(tmpDir, 'antigravity');
+      const projDir = path.join(tmpDir, 'project');
+      fs.mkdirSync(projDir, { recursive: true });
+      const projUri = JSON.stringify([pathToFileURL(projDir).href]);
+      const nowSec = Math.floor(Date.parse('2026-11-11T06:00:00Z') / 1000);
+
+      const parentId = 'parent-fail-sub';
+      const childGoodId = 'child-good-2';
+      const childTurn2Id = 'child-turn-2';
+
+      createDb(path.join(agHome, 'conversation_summaries.db'), [
+        {
+          conversation_id: parentId,
+          title: 'Parent',
+          last_modified_time: '2026-11-11T05:20:00Z',
+          workspace_uris: projUri,
+          nesting_depth: 0,
+        },
+        {
+          conversation_id: childGoodId,
+          title: 'Child Good',
+          last_modified_time: '2026-11-11T05:20:00Z',
+          workspace_uris: projUri,
+          parent_conversation_id: parentId,
+          nesting_depth: 1,
+        },
+        {
+          conversation_id: childTurn2Id,
+          title: 'Child Turn 2',
+          last_modified_time: '2026-11-11T05:21:00Z',
+          workspace_uris: projUri,
+          parent_conversation_id: parentId,
+          nesting_depth: 1,
+        },
+      ]);
+
+      writeJsonl(agHome, parentId, [
+        {
+          // invoke_subagent pertama gagal → GENERIC status ERROR tanpa conversationId
+          type: 'PLANNER_RESPONSE',
+          created_at: '2026-11-11T05:00:00Z',
+          step_index: 1,
+          status: 'DONE',
+          tool_calls: [
+            {
+              name: 'invoke_subagent',
+              args: { Role: 'Failed Subagent', Model: 'flash', TypeName: 'frontend-ui-dev', Prompt: 'Should be discarded' },
+            },
+          ],
+        },
+        {
+          type: 'GENERIC',
+          created_at: '2026-11-11T05:00:01Z',
+          step_index: 2,
+          status: 'ERROR',
+          error: 'Failed to launch subagent',
+          content: '',
+        },
+        {
+          // invoke_subagent kedua berhasil → wajib berpasangan dengan Role/Model panggilan kedua!
+          type: 'PLANNER_RESPONSE',
+          created_at: '2026-11-11T05:00:10Z',
+          step_index: 3,
+          status: 'DONE',
+          tool_calls: [
+            {
+              name: 'invoke_subagent',
+              args: { Role: 'Backend Architect', Model: 'gemini-2.5-pro', TypeName: 'backend-architect', Prompt: 'Design API' },
+            },
+          ],
+        },
+        {
+          type: 'GENERIC',
+          created_at: '2026-11-11T05:00:11Z',
+          step_index: 4,
+          status: 'DONE',
+          content: `Created the following subagent:\n{"conversationId":"${childGoodId}"}`,
+        },
+        {
+          // invoke_subagent tanpa GENERIC lalu USER_INPUT baru → entri stale dibersihkan
+          type: 'PLANNER_RESPONSE',
+          created_at: '2026-11-11T05:01:00Z',
+          step_index: 5,
+          status: 'DONE',
+          tool_calls: [
+            {
+              name: 'invoke_subagent',
+              args: { Role: 'Orphaned Subagent', Model: 'flash', TypeName: 'research', Prompt: 'Never completed' },
+            },
+          ],
+        },
+        {
+          type: 'USER_INPUT',
+          created_at: '2026-11-11T05:02:00Z',
+          step_index: 6,
+          content: 'Turn baru',
+        },
+        {
+          type: 'PLANNER_RESPONSE',
+          created_at: '2026-11-11T05:02:05Z',
+          step_index: 7,
+          status: 'DONE',
+          tool_calls: [
+            {
+              name: 'invoke_subagent',
+              args: { Role: 'QA Engineer', Model: 'pro', TypeName: 'qa-security-engineer', Prompt: 'Run tests' },
+            },
+          ],
+        },
+        {
+          type: 'GENERIC',
+          created_at: '2026-11-11T05:02:06Z',
+          step_index: 8,
+          status: 'DONE',
+          content: `Created the following subagent:\n{"conversationId":"${childTurn2Id}"}`,
+        },
+      ]);
+
+      const res = withEnvHome(agHome, () => {
+        const scanner = new TranscriptScanner(null, { window_days: 7, cooldown: 60 });
+        return scanner.scan(projDir, nowSec);
+      });
+
+      const runGood = res.runs.find((r) => r.id === childGoodId);
+      assert.ok(runGood);
+      assert.equal(runGood.role, 'Backend Architect');
+      assert.equal(runGood.model, 'gemini-2.5-pro');
+      assert.equal(runGood.agentType, 'backend-architect');
+      assert.equal(runGood.description, 'Design API');
+
+      const runTurn2 = res.runs.find((r) => r.id === childTurn2Id);
+      assert.ok(runTurn2);
+      assert.equal(runTurn2.role, 'QA Engineer');
+      assert.equal(runTurn2.model, 'pro');
+      assert.equal(runTurn2.agentType, 'qa-security-engineer');
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('orders resume before stop on identical timestamps in mergeResumesAndStops', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kantor-tr-tie-'));
+    try {
+      const agHome = path.join(tmpDir, 'antigravity');
+      const projDir = path.join(tmpDir, 'project');
+      fs.mkdirSync(projDir, { recursive: true });
+      const projUri = JSON.stringify([pathToFileURL(projDir).href]);
+      const nowSec = Math.floor(Date.parse('2026-11-11T06:00:00Z') / 1000);
+
+      createDb(path.join(agHome, 'conversation_summaries.db'), [
+        {
+          conversation_id: 'p-tie',
+          title: 'Parent Tie',
+          last_modified_time: '2026-11-11T05:10:00Z',
+          workspace_uris: projUri,
+          nesting_depth: 0,
+        },
+        {
+          conversation_id: 'c-tie',
+          title: 'Child Tie',
+          last_modified_time: '2026-11-11T05:10:00Z',
+          workspace_uris: projUri,
+          parent_conversation_id: 'p-tie',
+          nesting_depth: 1,
+        },
+      ]);
+
+      writeJsonl(agHome, 'c-tie', [
+        { type: 'USER_INPUT', created_at: '2026-11-11T05:00:00Z', step_index: 0 },
+        { type: 'PLANNER_RESPONSE', created_at: '2026-11-11T05:01:00Z', step_index: 1, status: 'DONE', content: 'Done', tool_calls: [] },
+      ]);
+      writeJsonl(agHome, 'p-tie', [
+        {
+          type: 'PLANNER_RESPONSE',
+          created_at: '2026-11-11T05:05:00Z',
+          step_index: 1,
+          status: 'DONE',
+          tool_calls: [
+            { name: 'send_message', args: { Recipient: 'c-tie', Message: 'Wake' } },
+            { name: 'manage_subagents', args: { Action: 'kill', ConversationIds: ['c-tie'] } },
+          ],
+        },
+      ]);
+
+      const res = withEnvHome(agHome, () => {
+        const scanner = new TranscriptScanner(null, { window_days: 7, cooldown: 60 });
+        return scanner.scan(projDir, nowSec);
+      });
+
+      // Pada timestamp identik 05:05:00Z, resume membuka segmen lalu stop langsung menutupnya (tidak menggantung [T, null])
+      assert.deepEqual(res.runs[0].segs, [
+        ['2026-11-11T05:00:00Z', '2026-11-11T05:01:00Z'],
+        ['2026-11-11T05:05:00Z', '2026-11-11T05:05:00Z'],
+      ]);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

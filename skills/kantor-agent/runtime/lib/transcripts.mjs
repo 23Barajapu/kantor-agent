@@ -25,6 +25,8 @@ const MAX_FILES = 12;
 const MAX_RESUMES = 80;
 const MAX_STOPS = 80;
 const MAX_SEEN_STEPS = 256;
+const MAX_PENDING_SUBAGENTS = 32;
+const MAX_PENDING_TOOLS = 64;
 
 const LIMIT_RE = /(usage limit|rate limit|limit reached|quota|resource_exhausted|resets? (at|in))/i;
 const RESULT_STEP_TYPES = new Set([
@@ -60,7 +62,7 @@ function unquoteArg(v) {
         const parsed = JSON.parse(sanitized);
         if (typeof parsed === 'string') return parsed;
       } catch {
-        return trimmed.slice(1, -1);
+        return trimmed;
       }
     }
   }
@@ -73,7 +75,10 @@ function argStr(args, ...keys) {
     const raw = args[k];
     if (raw === undefined || raw === null) continue;
     const val = unquoteArg(raw);
-    if (typeof val === 'string') return val;
+    if (typeof val === 'string') {
+      if (phpTrim(val) !== '') return val;
+      continue;
+    }
     if (typeof val === 'number' || typeof val === 'boolean') return String(val);
   }
   return '';
@@ -179,29 +184,6 @@ function relPath(rawPath, projectDir) {
   return oneLine(result, 120);
 }
 
-function safeCommandFallback(args) {
-  const raw = phpTrim(argStr(args, 'CommandLine'));
-  if (!raw) return 'Jalankan perintah';
-
-  let firstToken = '';
-  if (raw.startsWith('"') || raw.startsWith("'")) {
-    const q = raw[0];
-    const end = raw.indexOf(q, 1);
-    firstToken = end > 1 ? raw.slice(1, end) : raw.slice(1).split(/\s+/)[0] || '';
-  } else {
-    firstToken = raw.split(/[\s;|&]+/)[0] || '';
-  }
-
-  if (!firstToken || firstToken.includes('=') || firstToken.startsWith('-')) {
-    return 'Jalankan perintah';
-  }
-
-  const exe = basename(firstToken.replaceAll('\\', '/'));
-  const cleaned = oneLine(exe, 40);
-  if (!cleaned || cleaned.includes('•••')) return 'Jalankan perintah';
-  return `Jalankan ${cleaned}`;
-}
-
 function extractSpawnedConversationId(row) {
   if (typeof row.conversationId === 'string' && row.conversationId.trim() !== '') {
     return row.conversationId.trim();
@@ -256,11 +238,23 @@ function freshSummary() {
     events: [],
     files: [],
     pendingSubagents: [],
+    pendingToolCalls: [],
     spawned: {},
     resumes: [],
     stops: [],
     limit: null,
   };
+}
+
+function applyStepTokenDelta(s, inTok, outTok, cacheTok) {
+  s.tokens.input += Math.max(0, inTok - s.lastStep.input);
+  s.tokens.output += Math.max(0, outTok - s.lastStep.output);
+  s.tokens.cache_read += Math.max(0, cacheTok - s.lastStep.cache_read);
+  s.tokens.total = s.tokens.input + s.tokens.output + s.tokens.cache_read;
+
+  s.lastStep.input = Math.max(s.lastStep.input, inTok);
+  s.lastStep.output = Math.max(s.lastStep.output, outTok);
+  s.lastStep.cache_read = Math.max(s.lastStep.cache_read, cacheTok);
 }
 
 function isValidSummaryShape(s) {
@@ -347,7 +341,7 @@ function mergeResumesAndStops(baseSegs, resumeTimes, stopTimes, cooldownSec) {
     const ms = tsMs(t);
     if (ms !== null) timeline.push({ kind: 'stop', t, ms });
   }
-  timeline.sort((a, b) => a.ms - b.ms || (a.kind === 'stop' ? -1 : 1));
+  timeline.sort((a, b) => a.ms - b.ms || (a.kind === b.kind ? 0 : a.kind === 'resume' ? -1 : 1));
 
   for (const item of timeline) {
     if (item.kind === 'resume') {
@@ -488,7 +482,7 @@ export class TranscriptScanner {
 
     if (name === 'run_command') {
       const summary = phpTrim(argStr(args, 'toolSummary'));
-      const text = summary ? oneLine(summary, 120) : safeCommandFallback(args);
+      const text = summary ? oneLine(summary, 120) : 'Jalankan perintah';
       pushEvent(s, { t, kind: 'tool', tool: name, text });
       return;
     }
@@ -532,7 +526,7 @@ export class TranscriptScanner {
       const promptRaw = phpTrim(argStr(args, 'Prompt'));
       const prompt = promptRaw ? safeLine(promptRaw, 140) : '';
 
-      s.pendingSubagents.push({ role, model, agentType, prompt, t });
+      pushBounded(s.pendingSubagents, { role, model, agentType, prompt, t }, MAX_PENDING_SUBAGENTS);
       pushEvent(s, {
         t,
         kind: 'tool',
@@ -591,14 +585,7 @@ export class TranscriptScanner {
     let alreadyProcessedFinal = false;
 
     if (stepKey !== null && s.lastStep && s.lastStep.key === stepKey) {
-      s.tokens.input += Math.max(0, inTok - s.lastStep.input);
-      s.tokens.output += Math.max(0, outTok - s.lastStep.output);
-      s.tokens.cache_read += Math.max(0, cacheTok - s.lastStep.cache_read);
-      s.tokens.total = s.tokens.input + s.tokens.output + s.tokens.cache_read;
-
-      s.lastStep.input = Math.max(s.lastStep.input, inTok);
-      s.lastStep.output = Math.max(s.lastStep.output, outTok);
-      s.lastStep.cache_read = Math.max(s.lastStep.cache_read, cacheTok);
+      applyStepTokenDelta(s, inTok, outTok, cacheTok);
       s.lastStep.status = statusStr;
       alreadyProcessedTools = Boolean(s.lastStep.processedTools);
       alreadyProcessedFinal = Boolean(s.lastStep.processedFinal);
@@ -611,26 +598,14 @@ export class TranscriptScanner {
       s.lastStep.status !== '' &&
       s.lastStep.status !== 'DONE'
     ) {
-      s.tokens.input = Math.max(0, s.tokens.input + (inTok - s.lastStep.input));
-      s.tokens.output = Math.max(0, s.tokens.output + (outTok - s.lastStep.output));
-      s.tokens.cache_read = Math.max(0, s.tokens.cache_read + (cacheTok - s.lastStep.cache_read));
-      s.tokens.total = s.tokens.input + s.tokens.output + s.tokens.cache_read;
-
+      applyStepTokenDelta(s, inTok, outTok, cacheTok);
       alreadyProcessedTools = Boolean(s.lastStep.processedTools);
       alreadyProcessedFinal = Boolean(s.lastStep.processedFinal);
 
       s.lastStepKey = stepKey;
       pushBounded(s.seenStepKeys, stepKey, MAX_SEEN_STEPS);
-      s.lastStep = {
-        key: stepKey,
-        stepIdxStr,
-        status: statusStr,
-        input: inTok,
-        output: outTok,
-        cache_read: cacheTok,
-        processedTools: alreadyProcessedTools,
-        processedFinal: alreadyProcessedFinal,
-      };
+      s.lastStep.key = stepKey;
+      s.lastStep.status = statusStr;
     } else {
       s.tokens.input += inTok;
       s.tokens.output += outTok;
@@ -660,6 +635,11 @@ export class TranscriptScanner {
 
     if (toolCalls.length > 0) {
       if (!alreadyProcessedTools) {
+        if (!Array.isArray(s.pendingToolCalls)) s.pendingToolCalls = [];
+        s.pendingToolCalls = toolCalls
+          .map((tc) => (isPlainObj(tc) ? String(tc.name || tc.tool || '') : ''))
+          .filter(Boolean)
+          .slice(-MAX_PENDING_TOOLS);
         for (const tc of toolCalls) {
           this._consumeToolCall(s, tc, t, projectDir);
         }
@@ -697,6 +677,8 @@ export class TranscriptScanner {
     }
 
     if (row.type === 'USER_INPUT') {
+      s.pendingSubagents = [];
+      s.pendingToolCalls = [];
       openSegment(s.segs, t, this._cooldownSec());
       pushEvent(s, { t, kind: 'user', text: 'Instruksi dari user', tool: null });
       s.lastKind = 'user';
@@ -730,6 +712,7 @@ export class TranscriptScanner {
     }
 
     if (RESULT_STEP_TYPES.has(row.type)) {
+      const expectedTool = Array.isArray(s.pendingToolCalls) ? s.pendingToolCalls.shift() : undefined;
       if (row.type === 'GENERIC' && s.pendingSubagents.length > 0) {
         const childId = extractSpawnedConversationId(row);
         if (childId) {
@@ -741,6 +724,11 @@ export class TranscriptScanner {
             prompt: pending.prompt,
             t: pending.t || t,
           };
+        } else if (row.status === 'ERROR' || row.status === 'INVALID') {
+          const errHint = `${row.error ?? ''} ${row.content ?? ''}`;
+          if (expectedTool === 'invoke_subagent' || (!expectedTool && /subagent|invoke_subagent/i.test(errHint))) {
+            s.pendingSubagents.shift();
+          }
         }
       }
       if (row.status === 'ERROR') {
