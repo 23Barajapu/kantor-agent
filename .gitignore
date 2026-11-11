@@ -1,3 +1,32 @@
+# Worktree & SDD state
 .worktrees/
 .superpowers/
+
+# Dokumen desain & blueprint pribadi/lokal
+docs/
+*.pdf
+
+# Dependencies, OS & Editor
 node_modules/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Rahasia, konfigurasi lokal & runtime state
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*chat-token*
+*.sqlite
+*.db
+*.log
+.cache/
+.agents/kantor-agent.json
+.agents/plugins/
+server.json
+tunnel.json
+tunnel-url.txt

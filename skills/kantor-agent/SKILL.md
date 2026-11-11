@@ -8,7 +8,7 @@ description: >-
 
 # Kantor Agent (Antigravity Edition · Windows Native Node.js >= 22.5)
 
-Buka kantor 3D Three.js real-time untuk memantau **Ketua (Joko)**, **4 divisi Tim IT spesialis** (**Budi**, **Sari**, **Agus**, **Rina**), **Freelancer**, papan **Tugas Ketua** (`task.md`), pratinjau **Artifact**, serta **Laci Chat Ketua (`C`)** berbasis **`agy acp --stdio`** langsung dari browser — berjalan murni di **Node.js `>= 22.5`** tanpa WSL, `bash`, atau dependensi `npm` eksternal.
+Buka kantor 3D Three.js real-time untuk memantau **Ketua (Joko)**, **4 divisi Tim IT spesialis** (**Budi**, **Sari**, **Agus**, **Rina**), **Freelancer**, papan **Tugas Ketua** (`task.md`), pratinjau **Artifact**, serta **Laci Chat Ketua (`C`)** berbasis **`agy acp --stdio`** langsung dari browser. Berjalan murni di **Node.js `>= 22.5`** tanpa WSL, `bash`, atau dependensi `npm` eksternal.
 
 ## 1. Jalankan Launcher CLI (`kantor.mjs`)
 
@@ -53,7 +53,7 @@ Opsi umum: `--project <dir>`, `--storage <dir>`, `--bind <ip>`, `--port <n>`, `-
 - **Meja 1 · Sari (`Backend & AI`)** ← `TypeName: "backend-architect"`: Arsitektur modul, API, domain, database/migrasi, performa, observabilitas, `gemini-*`, `google-antigravity-sdk`.
 - **Meja 2 · Agus (`QA & Security`)** ← `TypeName: "qa-security-engineer"` / `"browser"`: TDD, debugging, Chrome DevTools, LCP, cookie/memory audit, OWASP/security review, verifikasi akhir.
 - **Meja 3 · Rina (`Product & Ops`)** ← `TypeName: "product-ops-researcher"` / `"research"`: Brainstorming, spesifikasi/PRD, riset primer, ADR/dokumen, CI/CD, Git/PR/triage, Google Docs/Sheets/Slides.
-- **Freelancer (Meja Cadangan)**: Menangani tugas paralel saat spesialis divisi target sedang bekerja/cooldown atau tugas tak terklasifikasi — **tidak pernah** meminjam meja divisi lain.
+- **Freelancer (Meja Cadangan)**: Menangani tugas paralel saat spesialis divisi target sedang bekerja/cooldown atau tugas tak terklasifikasi; **tidak pernah** meminjam meja divisi lain.
 
 ## 3. Konfigurasi Proyek (`.agents/kantor-agent.json`)
 

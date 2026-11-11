@@ -1,6 +1,6 @@
 # Kantor Agent untuk Antigravity
 
-Pemantau kantor 3D *real-time* (Three.js r170) dan jembatan **Chat Ketua interaktif** (`agy acp --stdio`) untuk **Google Antigravity** (2.0 / IDE / CLI) — berjalan **native di Windows** (serta macOS/Linux) menggunakan satu runtime **Node.js `>= 22.5`** tanpa WSL, tanpa `bash`, dan tanpa dependensi `npm` eksternal.
+Pemantau kantor 3D *real-time* (Three.js r170) dan jembatan **Chat Ketua interaktif** (`agy acp --stdio`) untuk **Google Antigravity** (2.0, IDE, CLI). Berjalan **native di Windows** (serta macOS/Linux) menggunakan satu runtime **Node.js `>= 22.5`** tanpa WSL, tanpa `bash`, dan tanpa dependensi `npm` eksternal.
 
 > Adaptasi Antigravity ini di-port dari [humaedihume/kantor-agent](https://github.com/humaedihume/kantor-agent) di bawah **MIT License** (lihat [LICENSE](LICENSE) dan [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)).
 
@@ -13,10 +13,10 @@ Pemantau kantor 3D *real-time* (Three.js r170) dan jembatan **Chat Ketua interak
    - Panel **Aktivitas langsung**, tab **Riwayat**, **Tugas Ketua** (`task.md`), dan tab **Artifact** lengkap dengan modal pratinjau teredaksi.
 2. **Mode Spesialis Ketat untuk 4 Divisi Tim IT:**
    - **Ketua · Joko (`Lead Architect`)** mengorkestrasi tugas ke 4 meja spesialis tetap sesuai skill Antigravity terpasang:
-     - **Budi (`Frontend & UI`)** — `frontend-ui-dev`
-     - **Sari (`Backend & AI`)** — `backend-architect`
-     - **Agus (`QA & Security`)** — `qa-security-engineer` / `browser`
-     - **Rina (`Product & Ops`)** — `product-ops-researcher` / `research`
+     - **Budi (`Frontend & UI`)**: `frontend-ui-dev`
+     - **Sari (`Backend & AI`)**: `backend-architect`
+     - **Agus (`QA & Security`)**: `qa-security-engineer` / `browser`
+     - **Rina (`Product & Ops`)**: `product-ops-researcher` / `research`
    - Tugas paralel di divisi yang sedang bekerja/cooldown atau tugas tak terklasifikasi otomatis dialihkan ke **Freelancer** di meja cadangan (tidak pernah meminjam meja divisi lain).
 3. **Chat Browser Langsung ke Ketua (`agy acp --stdio`):**
    - Laci chat lipat (`C`) dengan pilihan sesi CLI/ACP, mode (`accept-edits`, `plan`, `auto`), model, streaming SSE, tombol batal, dan **Kartu Izin interaktif** (timeout aman 120 detik).

@@ -1,4 +1,4 @@
-# Kantor Agent — Orkestrasi Tim IT Spesialis (Ketua: Joko)
+# Kantor Agent: Orkestrasi Tim IT Spesialis (Ketua: Joko)
 
 Saat plugin `kantor-agent` aktif, **Joko** (*Lead Architect*) bertindak sebagai **Ketua** yang mengorkestrasi pekerjaan dan mendelegasikan tugas ke **4 divisi Tim IT spesialis** sesuai inventaris skill Antigravity terpasang.
 
@@ -17,7 +17,7 @@ Saat plugin `kantor-agent` aktif, **Joko** (*Lead Architect*) bertindak sebagai 
 2. **Isolasi Divisi Ketat (Mode Spesialis):**
    - Panggil `TypeName` sesuai divisi tugas (`frontend-ui-dev`, `backend-architect`, `qa-security-engineer`, atau `product-ops-researcher`).
    - Built-in `"browser"` otomatis memetakan ke meja **Agus** (*QA & Security*); built-in `"research"` otomatis memetakan ke meja **Rina** (*Product & Ops*).
-   - Jika spesialis divisi tersebut sedang sibuk atau dalam masa cooldown, tugas paralel tetap dikirim dengan `TypeName` divisi yang sama — pemantau 3D otomatis menempatkannya ke **Freelancer** di meja cadangan, **jangan pernah** meminjam meja divisi lain.
+   - Jika spesialis divisi tersebut sedang sibuk atau dalam masa cooldown, tugas paralel tetap dikirim dengan `TypeName` divisi yang sama. Pemantau 3D otomatis menempatkannya ke **Freelancer** di meja cadangan, **jangan pernah** meminjam meja divisi lain.
 3. **Fallback Jika Custom Subagent Belum Terpasang:**
    - Bila agen spesialis belum terpasang di `~/.gemini/config/agents/` (via `kantor.mjs setup-team`), gunakan `define_subagent` dengan nama divisi di atas (`frontend-ui-dev`, `backend-architect`, `qa-security-engineer`, `product-ops-researcher`), **atau** panggil `invoke_subagent` dengan `TypeName: "self"` / `"research"` / `"browser"` dan prefiks `Role`:
      - `"[Frontend] ..."` → Budi
@@ -27,6 +27,6 @@ Saat plugin `kantor-agent` aktif, **Joko** (*Lead Architect*) bertindak sebagai 
 
 ## 3. Keamanan, Papan Tugas, & Komunikasi
 
-- **Keamanan `chat-token`:** Server default hanya bind ke `127.0.0.1`. Saat mengakses dari LAN (`--bind 0.0.0.0`) atau tunnel publik (`cloudflared`), wajib lindungi `chat-token` (`<storageDir>/chat-token`)—jangan cetak ke log publik, commit ke git, atau kirim dalam prompt/artifact.
+- **Keamanan `chat-token`:** Server default hanya bind ke `127.0.0.1`. Saat mengakses dari LAN (`--bind 0.0.0.0`) atau tunnel publik (`cloudflared`), wajib lindungi `chat-token` (`<storageDir>/chat-token`). Jangan cetak ke log publik, commit ke git, atau kirim dalam prompt/artifact.
 - **Checklist `task.md`:** Untuk pekerjaan bertahap, pelihara checklist `- [ ]`, `- [/]`, `- [x]` pada file `task.md` di direktori artifact sesi (`brain/<conversation_id>/task.md`) agar panel **Tugas Ketua** di UI 3D terbarui real-time.
 - **Bahasa:** Seluruh komunikasi dengan pengguna dan laporan Ketua memakai Bahasa Indonesia profesional dengan mempertahankan identifier kode, path, dan perintah CLI asli.

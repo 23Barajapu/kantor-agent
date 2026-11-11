@@ -65,10 +65,9 @@ describe('util.mjs', () => {
     });
 
     it('matches brief requirements on Windows path normalization', () => {
-      // Test the exact scenario from brief:
-      // normalizeWorkspacePath('file:///c%3A/Laragon/www/kantor-agent/') === normalizeWorkspacePath('C:\\laragon\\www\\kantor-agent')
-      const p1 = normalizeWorkspacePath('file:///c%3A/Laragon/www/kantor-agent/');
-      const p2 = normalizeWorkspacePath('C:\\laragon\\www\\kantor-agent');
+      // Compare URI and Windows backslash paths directly.
+      const p1 = normalizeWorkspacePath('file:///c%3A/Projects/sample-app/');
+      const p2 = normalizeWorkspacePath('C:\\projects\\sample-app');
       if (process.platform === 'win32') {
         assert.equal(p1, p2);
         assert.ok(!p1.endsWith('/'), 'trailing slash should be stripped for non-root paths');

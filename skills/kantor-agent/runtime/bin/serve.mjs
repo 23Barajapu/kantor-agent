@@ -540,6 +540,16 @@ export function createKantorServer(opts = {}) {
           ? err.message
           : 'Kesalahan internal server';
       const extraHeaders = status === 413 ? { Connection: 'close' } : {};
+      if (status === 413 && !req.complete && typeof req.resume === 'function') {
+        req.on('data', () => {});
+        req.on('error', () => {});
+        req.resume();
+        const drainTimer = setTimeout(() => {
+          if (!req.destroyed) req.destroy();
+        }, 50);
+        drainTimer.unref?.();
+        req.once('end', () => clearTimeout(drainTimer));
+      }
       return sendJson(res, status, { ok: false, error: errorMsg }, extraHeaders);
     }
   });

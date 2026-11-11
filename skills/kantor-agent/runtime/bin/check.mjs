@@ -119,7 +119,7 @@ try {
     const txt = JSON.stringify(s);
     t('tidak ada token sk-… / ghp_… yang lolos redaksi', !/\bsk-(?!•)[A-Za-z0-9_-]{8,}|\bghp_[A-Za-z0-9]{20,}/.test(txt));
     const busy = s.team.filter((m2) => m2.state === 'bekerja').map((m2) => m2.name);
-    console.log(`  ${s.project}: transkrip ${s.transcripts ? 'ada' : 'belum ada'} · ${s.ketua.name} (${s.ketua.role}) ${s.ketua.state} · tim bekerja: ${busy.join(', ') || '—'} · freelancer: ${s.freelancers.length} · ${s.stats.total} subagent (7 hari)`);
+    console.log(`  ${s.project}: transkrip ${s.transcripts ? 'ada' : 'belum ada'} · ${s.ketua.name} (${s.ketua.role}) ${s.ketua.state} · tim bekerja: ${busy.join(', ') || '-'} · freelancer: ${s.freelancers.length} · ${s.stats.total} subagent (7 hari)`);
   }
 
   const assetPaths = [
@@ -181,5 +181,5 @@ try {
 
 for (const g of good) console.log(`  ok    ${g}`);
 for (const b of bad) console.log(`  GAGAL ${b}`);
-console.log(bad.length ? `GAGAL (${bad.length})` : `OK (${good.length} pemeriksaan) — buka ${base}/kerja`);
+console.log(bad.length ? `GAGAL (${bad.length})` : `OK (${good.length} pemeriksaan). Buka ${base}/kerja`);
 process.exit(bad.length ? 1 : 0);

@@ -1,4 +1,4 @@
-// Kantor Agent — kantor 3D (three.js r170) yang digerakkan data nyata dari /kerja/api/state.
+// Kantor Agent: kantor 3D (three.js r170) yang digerakkan data nyata dari /kerja/api/state.
 // Ketua (sesi utama) punya meja sendiri; 4 spesialis tim IT santai di lounge dan duduk bekerja saat mendapat subagent;
 // freelancer datang lewat pintu bila tim penuh atau tugas tidak terklasifikasi. Tidak ada aktivitas palsu: tanpa data, semua santai.
 import * as THREE from 'three';
@@ -35,7 +35,7 @@ const COLORS = normalizeColors(CFG.colors);
 const NAMES_SIG = [KETUA_NAME, ...TEAM_NAMES].join('|');
 const SPARE = Number.isInteger(CFG.spare_desks) ? Math.max(0, Math.min(4, CFG.spare_desks)) : 4;
 
-// ---------------------------------------------------------------- bantuan umum
+// bantuan umum
 const $ = (id) => document.getElementById(id);
 const fmtTime = new Intl.DateTimeFormat('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
 const fmtHm = new Intl.DateTimeFormat('id-ID', { hour: '2-digit', minute: '2-digit', hour12: false });
@@ -106,7 +106,7 @@ const PLAN_TOOLS = new Set([
   'Agent', 'Task', 'SendMessage', 'AskUserQuestion',
 ]);
 
-// ---------------------------------------------------------------- renderer
+// renderer
 const host = $('scene');
 let renderer;
 try {
@@ -174,7 +174,7 @@ sun.shadow.bias = -0.0005;
 sun.shadow.normalBias = 0.02;
 scene.add(sun);
 
-// ---------------------------------------------------------------- material / mesh / tekstur
+// material / mesh / tekstur
 const matCache = new Map();
 function mat(color, rough = 0.8, metal = 0) {
   const k = `${color}|${rough}|${metal}`;
@@ -237,7 +237,7 @@ const SANS = 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial
 const MONO = 'ui-monospace, Menlo, Consolas, monospace';
 const V = (x, z) => new THREE.Vector3(x, 0, z);
 
-// ---------------------------------------------------------------- ruangan
+// ruangan
 const ROOM = { x0: -10, x1: 10, z0: -7, z1: 6, h: 5.2 };
 const CORRIDOR_Z = -2.1;
 (function buildRoom() {
@@ -383,7 +383,7 @@ function paintSky(night) {
   }
 }
 
-// ---------------------------------------------------------------- perabot
+// perabot
 function plant(x, z, s = 1, seed = 1) {
   const g = new THREE.Group();
   g.position.set(x, 0, z);
@@ -799,7 +799,7 @@ const LOUNGE_PADS = [];
   scene.add(lounge, tvCorner(4.9, 0, -1.3));
 })();
 
-// ---------------------------------------------------------------- papan dinding
+// papan dinding
 function wallBoard({ w, h, cw, ch, pos, rotY }) {
   const g = new THREE.Group();
   g.position.copy(pos);
@@ -871,7 +871,7 @@ function drawClock() {
   tex.needsUpdate = true;
 }
 
-// ---------------------------------------------------------------- karakter
+// karakter
 const LOOKS = {
   ketua: { shirt: '#6f5bbd', pants: '#2d3140', skin: '#b97d52', hair: '#221a15', hairStyle: 'side', tie: true },
   team: [
@@ -1166,7 +1166,7 @@ function seatedPose(mode, t, seed) {
   return T;
 }
 
-// ---------------------------------------------------------------- meja kerja + monitor
+// meja kerja + monitor
 function monitor(w, h) {
   const g = new THREE.Group();
   const bezel = mesh(box(w + 0.06, h + 0.06, 0.035, 0.015), mat('#22252b', 0.4, 0.2));
@@ -1290,7 +1290,7 @@ function buildDesk(def) {
 }
 DESK_DEFS.forEach(buildDesk);
 
-// ---------------------------------------------------------------- tempat & jalur
+// tempat & jalur
 const PLACES = {};
 for (const d of Object.values(desks)) {
   const seatPos = V(d.x, d.z + 0.95);
@@ -1368,7 +1368,7 @@ const CHAT = [
   ['Sore ini cerah ya', 'Enak buat jalan-jalan'],
 ];
 
-// ---------------------------------------------------------------- aktor
+// aktor
 const actors = new Map();
 const pickables = [];
 const tmpV = new THREE.Vector3();
@@ -1644,7 +1644,7 @@ const TEAM = TEAM_NAMES.map((n, i) => makeActor({
   desk: `A${i + 1}`,
 }));
 
-// ---------------------------------------------------------------- lounge
+// lounge
 const LOUNGE = { chatAt: performance.now() + 4000 };
 function claimedSpots(except) {
   const s = new Set();
@@ -1676,7 +1676,7 @@ function chatter(now) {
   setTimeout(() => { if (!ls.work && ls.goal?.startsWith('spot:')) say(ls, r, 4200); }, 2300);
 }
 
-// ---------------------------------------------------------------- layar monitor & papan
+// layar monitor & papan
 function drawIdleScreen(scr, title, sub, css, dim) {
   const { ctx, canvas, tex } = scr;
   const W = canvas.width;
@@ -1726,7 +1726,7 @@ function drawWorkScreen(scr, who, events, title, footer, mode) {
   });
   ctx.fillStyle = term ? '#cfd6e6' : '#4a463f';
   ctx.font = `600 28px ${SANS}`;
-  ctx.fillText(fit(ctx, `${screenApp(mode)} — ${title}`, W - 160), 130, 39);
+  ctx.fillText(fit(ctx, `${screenApp(mode)}: ${title}`, W - 160), 130, 39);
   const rows = (events || []).slice(0, 8);
   ctx.font = `500 25px ${MONO}`;
   let y = 104;
@@ -1929,9 +1929,9 @@ function drawHistBoard(runs) {
   ctx.font = `36px ${HAND}`;
   ctx.fillText(fit(ctx, `sumber: transkrip subagent · ${list.length} tugas`, W - 640), 600, 80);
   if (!list.length) {
-    ctx.fillStyle = '#9a938a';
+    ctx.fillStyle = '#5e5952';
     ctx.font = `44px ${HAND}`;
-    ctx.fillText('Belum ada subagent hari ini — tim sedang santai.', 44, 200);
+    ctx.fillText('Belum ada subagent hari ini. Tim sedang santai.', 44, 200);
   }
   list.slice(0, 9).forEach((r, i) => {
     const y = 170 + i * 92;
@@ -1962,11 +1962,11 @@ function drawHistBoard(runs) {
   tex.needsUpdate = true;
 }
 
-// ---------------------------------------------------------------- modal & chat drawer
+// modal & chat drawer
 const artifactModal = createArtifactModal({ $, fmtDate, ago });
 const chatDrawer = createChatDrawer({ $, cfg: CFG, ketuaName: KETUA_NAME, ago, clip });
 
-// ---------------------------------------------------------------- data nyata -> karakter
+// data nyata -> karakter
 let S = null;
 let firstLoad = true;
 let prevFeedKeys = new Set();
@@ -2163,7 +2163,7 @@ function apply(d) {
   firstLoad = false;
 }
 
-// ---------------------------------------------------------------- UI HTML
+// UI HTML
 function stateChip(state, extra = '') {
   const ui = STATE_UI[state] || STATE_UI.santai;
   return `<span class="chip st" style="color:${ui.css}"><i></i>${esc(ui.label)}${extra}</span>`;
@@ -2174,9 +2174,9 @@ function artifactBadgeHtml(run, owner, division) {
   if (!arts.length) return '';
   if (arts.length === 1) {
     const a = arts[0];
-    return `<button type="button" class="art-jump" data-open-art="1" data-art-conv="${esc(a.conv_id)}" data-art-file="${esc(a.name)}" data-art-owner="${esc(owner)}" data-art-div="${esc(division || '')}" data-art-summary="${esc(a.summary || '')}" data-art-updated="${esc(a.updated_at || '')}" title="Pratinjau ${esc(a.name)}">📄 1</button>`;
+    return `<button type="button" class="art-jump" data-open-art="1" data-art-conv="${esc(a.conv_id)}" data-art-file="${esc(a.name)}" data-art-owner="${esc(owner)}" data-art-div="${esc(division || '')}" data-art-summary="${esc(a.summary || '')}" data-art-updated="${esc(a.updated_at || '')}" title="Pratinjau ${esc(a.name)}">1 file</button>`;
   }
-  return `<button type="button" class="art-jump" data-jump-tab="artifact" title="Lihat ${arts.length} artifact di tab Artifact">📄 ${arts.length}</button>`;
+  return `<button type="button" class="art-jump" data-jump-tab="artifact" title="Lihat ${arts.length} artifact di tab Artifact">${arts.length} file</button>`;
 }
 
 function renderUi(d, fresh) {
@@ -2191,11 +2191,11 @@ function renderUi(d, fresh) {
   const workingTeam = d.team.filter((m) => m.state === 'bekerja').map((m) => m.name);
   const flWork = d.freelancers.filter((f) => f.state === 'bekerja').length;
   let phase;
-  if (!d.transcripts) phase = 'Belum ada transkrip Antigravity untuk folder ini — kantor terisi otomatis setelah Antigravity dipakai di sini.';
+  if (!d.transcripts) phase = 'Belum ada transkrip Antigravity untuk folder ini. Kantor terisi otomatis setelah Antigravity dipakai di sini.';
   else if (workingTeam.length || flWork) phase = `Sedang bekerja: ${[...workingTeam, ...(flWork ? [`${flWork} freelancer`] : [])].join(', ')}${d.ketua.state === 'bekerja' ? ` · ${KETUA_NAME} memantau` : ''}`;
-  else if (d.ketua.state === 'bekerja') phase = `${KETUA_NAME} sedang bekerja di sesi utama — tim santai menunggu tugas`;
-  else if (d.ketua.state === 'selesai') phase = `${KETUA_NAME} baru selesai — menunggu instruksi berikutnya`;
-  else phase = 'Semua santai ☕ — nonton, ngopi & ngobrol. Otomatis kembali kerja saat ada subagent.';
+  else if (d.ketua.state === 'bekerja') phase = `${KETUA_NAME} sedang bekerja di sesi utama, tim santai menunggu tugas`;
+  else if (d.ketua.state === 'selesai') phase = `${KETUA_NAME} baru selesai, menunggu instruksi berikutnya`;
+  else phase = 'Semua santai di lounge. Otomatis kembali kerja saat ada subagent.';
   $('phase').textContent = phase;
   $('phase').title = phase;
 
@@ -2331,8 +2331,8 @@ function renderUi(d, fresh) {
     }));
   }
   if (extra.length) {
-    const title = extra.map((f) => `Freelancer · ${f.name} — ${STATE_UI[f.state]?.label || f.state}: ${f.run?.task || ''}`).join('\n');
-    cards.push(`<div class="card card-ui more" tabindex="0" title="${esc(title)}" aria-label="${esc(`${extra.length} freelancer lain tanpa meja`)}"><span class="ava">+${extra.length}</span><div class="h"><span class="nm">Freelancer lain</span></div><div class="task">${esc(extra.slice(0, 3).map((f) => f.name).join(', '))}${extra.length > 3 ? ' …' : ''}</div><div class="act"><span class="act-txt">meja cadangan penuh — tetap dihitung</span></div></div>`);
+    const title = extra.map((f) => `Freelancer · ${f.name}: ${STATE_UI[f.state]?.label || f.state}: ${f.run?.task || ''}`).join('\n');
+    cards.push(`<div class="card card-ui more" tabindex="0" title="${esc(title)}" aria-label="${esc(`${extra.length} freelancer lain tanpa meja`)}"><span class="ava">+${extra.length}</span><div class="h"><span class="nm">Freelancer lain</span></div><div class="task">${esc(extra.slice(0, 3).map((f) => f.name).join(', '))}${extra.length > 3 ? ' …' : ''}</div><div class="act"><span class="act-txt">meja cadangan penuh, tetap dihitung</span></div></div>`);
   }
   const el = $('cards');
   const n = cards.length;
@@ -2343,10 +2343,10 @@ function renderUi(d, fresh) {
 }
 
 function cardHtml({ key, name, role, roleTitle, color, state, task, act, working, isFl = false, extraHtml = '' }) {
-  return `<div role="button" tabindex="0" class="card card-ui${working ? ' working' : ''}${isFl ? ' fl' : ''}" data-focus="${esc(key)}" style="--c:${esc(color)}"><span class="ava">${esc(initial(name))}</span><div class="h"><span class="nm">${esc(name)}</span><span class="role" title="${esc(roleTitle || role)}">${esc(role)}</span>${stateChip(state)}</div><div class="task" title="${esc(task)}">${esc(task || '—')}</div><div class="act" title="${esc(act)}"><span class="act-txt">${esc(act || '—')}</span>${extraHtml}</div></div>`;
+  return `<div role="button" tabindex="0" class="card card-ui${working ? ' working' : ''}${isFl ? ' fl' : ''}" data-focus="${esc(key)}" style="--c:${esc(color)}"><span class="ava">${esc(initial(name))}</span><div class="h"><span class="nm">${esc(name)}</span><span class="role" title="${esc(roleTitle || role)}">${esc(role)}</span>${stateChip(state)}</div><div class="task" title="${esc(task)}">${esc(task || '-')}</div><div class="act" title="${esc(act)}"><span class="act-txt">${esc(act || '-')}</span>${extraHtml}</div></div>`;
 }
 
-// ---------------------------------------------------------------- interaksi
+// interaksi
 function setMin(side, on) {
   const panel = document.querySelector(`.side.${side}`);
   if (!panel) return;
@@ -2524,7 +2524,7 @@ function updateDaylight() {
   for (const d of Object.values(desks)) d.lamp.intensity = night ? 3 : 0;
 }
 
-// ---------------------------------------------------------------- loop animasi
+// loop animasi
 const clock = new THREE.Clock();
 let lastSec = 0;
 let gameAt = 0;
