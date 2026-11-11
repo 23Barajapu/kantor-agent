@@ -190,7 +190,9 @@ export class AcpBridge {
     isCliSession = null,
     permissionTimeoutMs = 120_000,
     rpcTimeoutMs = DEFAULT_RPC_TIMEOUT_MS,
-    modelsTimeoutMs = 15_000,
+    modelsTimeoutMs = Number(process.env.KANTOR_MODELS_TIMEOUT_MS) > 0
+      ? Number(process.env.KANTOR_MODELS_TIMEOUT_MS)
+      : 60_000,
     modelsCacheTtlMs = 300_000,
   } = {}) {
     this.projectDir =
@@ -218,7 +220,11 @@ export class AcpBridge {
     this.rpcTimeoutMs =
       Number.isFinite(rpcTimeoutMs) && rpcTimeoutMs > 0 ? rpcTimeoutMs : DEFAULT_RPC_TIMEOUT_MS;
     this.modelsTimeoutMs =
-      Number.isFinite(modelsTimeoutMs) && modelsTimeoutMs > 0 ? modelsTimeoutMs : 15_000;
+      Number.isFinite(modelsTimeoutMs) && modelsTimeoutMs > 0
+        ? modelsTimeoutMs
+        : Number(process.env.KANTOR_MODELS_TIMEOUT_MS) > 0
+          ? Number(process.env.KANTOR_MODELS_TIMEOUT_MS)
+          : 60_000;
     this.modelsCacheTtlMs =
       Number.isFinite(modelsCacheTtlMs) && modelsCacheTtlMs > 0 ? modelsCacheTtlMs : 300_000;
     this._modelsCache = null;

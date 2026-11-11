@@ -54,6 +54,58 @@ export function formatRoleModel(role, model, fallback = '') {
   return combined ? clip(combined, 26) : '';
 }
 
+export function formatModelOptionLabel(model) {
+  if (!model) return '';
+  const id = model.id ? String(model.id).trim() : '';
+  const name = model.name ? String(model.name).trim() : '';
+  if (!id) return name;
+  if (!name || name === id) return id;
+  return `${name} · ${id}`;
+}
+
+export function resolveModelSelectionState(statusModel, models = [], modelsFetched = false, userCustomSelected = false) {
+  const normModel = statusModel ? String(statusModel).trim() : null;
+  if (userCustomSelected) {
+    return {
+      selectValue: '__custom__',
+      showCustom: true,
+      customValue: normModel || '',
+      tempOptionId: null,
+    };
+  }
+  if (!normModel) {
+    return {
+      selectValue: '',
+      showCustom: false,
+      customValue: '',
+      tempOptionId: null,
+    };
+  }
+  const found = Array.isArray(models) && models.some((m) => m && m.id === normModel);
+  if (found) {
+    return {
+      selectValue: normModel,
+      showCustom: false,
+      customValue: '',
+      tempOptionId: null,
+    };
+  }
+  if (!modelsFetched) {
+    return {
+      selectValue: normModel,
+      showCustom: false,
+      customValue: '',
+      tempOptionId: normModel,
+    };
+  }
+  return {
+    selectValue: '__custom__',
+    showCustom: true,
+    customValue: normModel,
+    tempOptionId: null,
+  };
+}
+
 export function isSafeHref(rawUrl) {
   if (typeof rawUrl !== 'string') return null;
   const trimmed = rawUrl.trim();
@@ -457,7 +509,9 @@ export function createChatDrawer({ $, cfg, ketuaName, ago, clip: clipFn }) {
   const sessionSelect = $('chatSessionSelect');
   const sessionBtn = $('chatSessionBtn');
   const modeSelect = $('chatModeSelect');
-  const modelInput = $('chatModelInput');
+  const modelSelect = $('chatModelSelect');
+  const customModelRow = $('chatCustomModelRow');
+  const modelCustomInput = $('chatModelCustom');
 
   const authBox = $('chatAuthBox');
   const authForm = $('chatAuthForm');
@@ -497,6 +551,11 @@ export function createChatDrawer({ $, cfg, ketuaName, ago, clip: clipFn }) {
   };
   let sessionsList = [];
   let lastSessionsSig = '';
+  let modelsList = [];
+  let modelsFetched = false;
+  let modelsFetching = false;
+  let customMode = false;
+  let lastModelsSig = '';
   let messages = [];
   const pendingPerms = new Map();
 
@@ -511,12 +570,80 @@ export function createChatDrawer({ $, cfg, ketuaName, ago, clip: clipFn }) {
     noticeEl.hidden = false;
   };
 
+  const syncModelOptions = (tempOptionId = null) => {
+    if (!modelSelect) return;
+    const sig = JSON.stringify([modelsList.map((m) => [m.id, m.name]), tempOptionId]);
+    if (sig === lastModelsSig) return;
+    lastModelsSig = sig;
+
+    const prevVal = modelSelect.value;
+    modelSelect.innerHTML = '';
+
+    const defOpt = document.createElement('option');
+    defOpt.value = '';
+    defOpt.textContent = 'Default (ikuti CLI)';
+    modelSelect.appendChild(defOpt);
+
+    for (const m of modelsList) {
+      if (!m || !m.id) continue;
+      const opt = document.createElement('option');
+      opt.value = m.id;
+      opt.textContent = formatModelOptionLabel(m);
+      modelSelect.appendChild(opt);
+    }
+
+    if (tempOptionId && !modelsList.some((m) => m && m.id === tempOptionId)) {
+      const tempOpt = document.createElement('option');
+      tempOpt.value = tempOptionId;
+      tempOpt.textContent = tempOptionId;
+      modelSelect.appendChild(tempOpt);
+    }
+
+    const customOpt = document.createElement('option');
+    customOpt.value = '__custom__';
+    customOpt.textContent = 'Model custom\u2026';
+    modelSelect.appendChild(customOpt);
+
+    if (prevVal) {
+      modelSelect.value = prevVal;
+    }
+  };
+
+  const loadModels = async ({ force = false } = {}) => {
+    if (modelsFetching) return;
+    if (modelsFetched && !force && modelsList.length > 0) return;
+    modelsFetching = true;
+    try {
+      const url = force ? '/kerja/api/chat/models?refresh=1' : '/kerja/api/chat/models';
+      const res = await fetch(url, {
+        credentials: 'same-origin',
+        headers: { Accept: 'application/json' },
+      });
+      if (res.ok) {
+        const data = await res.json().catch(() => ({}));
+        if (data && Array.isArray(data.models)) {
+          modelsList = data.models;
+          modelsFetched = true;
+        }
+        if (data?.degraded && data?.error && modelsList.length === 0) {
+          setNotice(data.error, 'info');
+        }
+      }
+    } catch {
+      // Degraded / network error silently handled
+    } finally {
+      modelsFetching = false;
+      renderStatus();
+    }
+  };
+
   const syncControlsDisabled = () => {
     const off = !enabled || needsAuth;
     sessionSelect.disabled = off || status.busy;
     sessionBtn.disabled = off || status.busy;
     modeSelect.disabled = off || status.busy;
-    modelInput.disabled = off || status.busy;
+    if (modelSelect) modelSelect.disabled = off || status.busy;
+    if (modelCustomInput) modelCustomInput.disabled = off || status.busy;
     inputEl.disabled = !enabled || needsAuth;
     sendBtn.disabled = off || status.busy || inputEl.value.trim() === '';
     cancelBtn.hidden = !status.busy;
@@ -555,8 +682,28 @@ export function createChatDrawer({ $, cfg, ketuaName, ago, clip: clipFn }) {
     if (modeSelect.value !== status.mode && ['accept-edits', 'plan', 'auto'].includes(status.mode)) {
       modeSelect.value = status.mode;
     }
-    if (document.activeElement !== modelInput) {
-      modelInput.value = status.model || '';
+
+    if (status.model && Array.isArray(modelsList) && modelsList.some((m) => m && m.id === status.model)) {
+      customMode = false;
+    } else if (!status.model) {
+      if (modelSelect && modelSelect.value !== '__custom__') {
+        customMode = false;
+      }
+    }
+
+    const resolved = resolveModelSelectionState(status.model, modelsList, modelsFetched, customMode);
+    if (resolved.showCustom) {
+      customMode = true;
+    }
+    syncModelOptions(resolved.tempOptionId);
+    if (modelSelect && document.activeElement !== modelSelect) {
+      modelSelect.value = resolved.selectValue;
+    }
+    if (customModelRow) {
+      customModelRow.hidden = !resolved.showCustom;
+    }
+    if (modelCustomInput && resolved.showCustom && document.activeElement !== modelCustomInput) {
+      modelCustomInput.value = resolved.customValue || '';
     }
 
     const pCount = pendingPerms.size || Number(status.pendingPermissionCount) || 0;
@@ -981,6 +1128,7 @@ export function createChatDrawer({ $, cfg, ketuaName, ago, clip: clipFn }) {
       setNotice('');
       renderStatus();
       connectStream();
+      loadModels();
       return true;
     } catch (err) {
       setNotice(err?.message || 'Gagal menghubungi endpoint auth chat');
@@ -989,9 +1137,13 @@ export function createChatDrawer({ $, cfg, ketuaName, ago, clip: clipFn }) {
   };
 
   const currentModelValue = () => {
-    const raw = modelInput.value.trim();
-    if (!raw || raw.toLowerCase() === 'default') return null;
-    return raw;
+    if (customMode || (modelSelect && modelSelect.value === '__custom__')) {
+      const raw = modelCustomInput ? modelCustomInput.value.trim() : '';
+      return raw || null;
+    }
+    const val = modelSelect ? modelSelect.value.trim() : '';
+    if (!val || val.toLowerCase() === 'default') return null;
+    return val;
   };
 
   authForm.addEventListener('submit', async (e) => {
@@ -1040,13 +1192,39 @@ export function createChatDrawer({ $, cfg, ketuaName, ago, clip: clipFn }) {
   };
 
   modeSelect.addEventListener('change', applyModeOrModelIfActive);
-  modelInput.addEventListener('change', applyModeOrModelIfActive);
-  modelInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      applyModeOrModelIfActive();
-    }
-  });
+  if (modelSelect) {
+    modelSelect.addEventListener('change', () => {
+      if (modelSelect.value === '__custom__') {
+        customMode = true;
+        if (customModelRow) customModelRow.hidden = false;
+        if (modelCustomInput) {
+          modelCustomInput.focus();
+        }
+        syncControlsDisabled();
+      } else {
+        customMode = false;
+        if (customModelRow) customModelRow.hidden = true;
+        applyModeOrModelIfActive();
+      }
+    });
+  }
+  if (modelCustomInput) {
+    modelCustomInput.addEventListener('change', () => {
+      const off = !enabled || needsAuth;
+      if (!off && !status.busy) {
+        applyModeOrModelIfActive();
+      }
+    });
+    modelCustomInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        const off = !enabled || needsAuth;
+        if (!off && !status.busy) {
+          applyModeOrModelIfActive();
+        }
+      }
+    });
+  }
 
   inputEl.addEventListener('input', syncControlsDisabled);
   inputEl.addEventListener('keydown', (e) => {
@@ -1113,6 +1291,8 @@ export function createChatDrawer({ $, cfg, ketuaName, ago, clip: clipFn }) {
     toggleBtn.setAttribute('aria-expanded', 'true');
     if (enabled && !authorized && !needsAuth) {
       bootstrapAuth();
+    } else if (authorized && (!modelsFetched || modelsList.length === 0)) {
+      loadModels();
     }
     if (needsAuth && !authBox.hidden) tokenInput.focus();
     else inputEl.focus();

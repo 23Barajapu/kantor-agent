@@ -519,4 +519,107 @@ describe('Task 8 UI, CSP nonce, XSS escaping & smoke check', () => {
       cleanDir(env.base);
     }
   });
+
+  it('Task 3: dynamic model select UI, custom fallback, and pure helpers', async () => {
+    const env = makeTempEnv();
+    const cfg = loadConfig(RUNTIME_DIR, env.projectDir);
+    const { server, port } = await startServer({
+      projectDir: env.projectDir,
+      runtimeDir: RUNTIME_DIR,
+      storageDir: env.storageDir,
+      cfg,
+    });
+
+    try {
+      const res = await rawGet(port, '/kerja', { Host: `127.0.0.1:${port}` });
+      assert.equal(res.status, 200);
+
+      // DOM markup assertions
+      assert.ok(res.text.includes('<select id="chatModelSelect" aria-label="Pilih model chat">'), 'wajib memiliki select#chatModelSelect');
+      assert.ok(res.text.includes('<option value="">Default (ikuti CLI)</option>'), 'wajib memiliki opsi Default');
+      assert.ok(res.text.includes('<option value="__custom__">Model custom…'), 'wajib memiliki opsi Model custom…');
+      assert.ok(res.text.includes('<div class="chat-row" id="chatCustomModelRow" hidden>'), 'wajib memiliki row#chatCustomModelRow hidden');
+      assert.ok(res.text.includes('<input id="chatModelCustom" type="text"'), 'wajib memiliki input#chatModelCustom');
+
+      // Obsolete static presets must NOT exist
+      assert.equal(res.text.includes('gemini-2.5-pro'), false, 'page.html tidak boleh memuat hardcoded gemini-2.5-pro');
+      assert.equal(res.text.includes('gemini-2.5-flash'), false, 'page.html tidak boleh memuat hardcoded gemini-2.5-flash');
+      assert.equal(res.text.includes('gemini-3-pro'), false, 'page.html tidak boleh memuat hardcoded gemini-3-pro');
+      assert.equal(res.text.includes('chatModelPresets'), false, 'page.html tidak boleh memuat chatModelPresets');
+      assert.equal(res.text.includes('chatModelInput'), false, 'page.html tidak boleh memuat chatModelInput');
+
+      // Mobile touch-target rule
+      assert.ok(
+        res.text.includes('.chat-row select, .chat-row input { min-height: 44px; }'),
+        'mobile touch-target min-height: 44px wajib diterapkan ke chat-row select dan input'
+      );
+
+      // chat-ui.js zero-Claude and zero-TodoWrite guard
+      const chatUiJs = fs.readFileSync(path.join(RUNTIME_DIR, 'public', 'assets', 'chat-ui.js'), 'utf8');
+      assert.equal(/\bClaude\b/i.test(chatUiJs), false, 'chat-ui.js tidak boleh menyebut Claude');
+      assert.equal(/\bTodoWrite\b/i.test(chatUiJs), false, 'chat-ui.js tidak boleh menyebut TodoWrite');
+
+      // Pure helper tests
+      const mod = await import(pathToFileURL(path.join(RUNTIME_DIR, 'public', 'assets', 'chat-ui.js')).href);
+      assert.equal(typeof mod.formatModelOptionLabel, 'function', 'formatModelOptionLabel wajib diekspor');
+      assert.equal(typeof mod.resolveModelSelectionState, 'function', 'resolveModelSelectionState wajib diekspor');
+
+      // formatModelOptionLabel tests
+      assert.equal(
+        mod.formatModelOptionLabel({ id: 'gemini-3.8-flash-high', name: 'Gemini 3.8 Flash (High)' }),
+        'Gemini 3.8 Flash (High) · gemini-3.8-flash-high'
+      );
+      assert.equal(
+        mod.formatModelOptionLabel({ id: 'gemini-3.8-flash-high', name: 'gemini-3.8-flash-high' }),
+        'gemini-3.8-flash-high',
+        'id alone when name === id'
+      );
+      assert.equal(
+        mod.formatModelOptionLabel({ id: 'custom-model' }),
+        'custom-model'
+      );
+      assert.equal(mod.formatModelOptionLabel(null), '');
+
+      // resolveModelSelectionState tests
+      const loadedModels = [
+        { id: 'gemini-3.8-flash-high', name: 'Gemini 3.8 Flash (High)' },
+        { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro' },
+      ];
+
+      // 1. statusModel = null, not custom-selected -> { selectValue: '', showCustom: false, tempOptionId: null }
+      const s1 = mod.resolveModelSelectionState(null, loadedModels, false, false);
+      assert.equal(s1.selectValue, '');
+      assert.equal(s1.showCustom, false);
+      assert.equal(s1.tempOptionId, null);
+
+      // 2. statusModel = 'gemini-3.8-flash-high' present in models -> { selectValue: 'gemini-3.8-flash-high', showCustom: false, tempOptionId: null }
+      const s2 = mod.resolveModelSelectionState('gemini-3.8-flash-high', loadedModels, true, false);
+      assert.equal(s2.selectValue, 'gemini-3.8-flash-high');
+      assert.equal(s2.showCustom, false);
+      assert.equal(s2.tempOptionId, null);
+
+      // 3. statusModel = 'custom-exp' before modelsFetched === false -> { selectValue: 'custom-exp', showCustom: false, tempOptionId: 'custom-exp' }
+      const s3 = mod.resolveModelSelectionState('custom-exp', [], false, false);
+      assert.equal(s3.selectValue, 'custom-exp');
+      assert.equal(s3.showCustom, false);
+      assert.equal(s3.tempOptionId, 'custom-exp');
+
+      // 4. statusModel = 'custom-exp' after modelsFetched === true and absent from models -> { selectValue: '__custom__', showCustom: true, customValue: 'custom-exp', tempOptionId: null }
+      const s4 = mod.resolveModelSelectionState('custom-exp', loadedModels, true, false);
+      assert.equal(s4.selectValue, '__custom__');
+      assert.equal(s4.showCustom, true);
+      assert.equal(s4.customValue, 'custom-exp');
+      assert.equal(s4.tempOptionId, null);
+
+      // 5. userCustomSelected = true explicitly selects custom
+      const s5 = mod.resolveModelSelectionState(null, loadedModels, true, true);
+      assert.equal(s5.selectValue, '__custom__');
+      assert.equal(s5.showCustom, true);
+      assert.equal(s5.customValue, '');
+      assert.equal(s5.tempOptionId, null);
+    } finally {
+      await stopServer(server);
+      cleanDir(env.base);
+    }
+  });
 });

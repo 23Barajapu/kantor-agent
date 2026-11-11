@@ -277,6 +277,7 @@ body.lapang .cards { opacity: .92; }
   .chat-toggle { padding: 0 12px; min-height: 44px; min-width: 44px; }
   .minbtn, .modal-close { min-width: 44px; min-height: 44px; }
   .tabs button, .chat-btn, .modal-btn { min-height: 44px; }
+  .chat-row select, .chat-row input { min-height: 44px; }
   .card-chat-btn, .art-jump { min-height: 36px; padding: 6px 10px; }
   .banner { top: auto; bottom: 46vh; }
   .side.right { top: auto; left: 10px; right: 10px; width: auto; bottom: 10px; height: 38vh; }
@@ -392,14 +393,16 @@ body.lapang .cards { opacity: .92; }
         </select>
       </label>
       <label class="chat-field">Model
-        <input id="chatModelInput" type="text" list="chatModelPresets" placeholder="default" autocomplete="off">
+        <select id="chatModelSelect" aria-label="Pilih model chat">
+          <option value="">Default (ikuti CLI)</option>
+          <option value="__custom__">Model custom…</option>
+        </select>
       </label>
-      <datalist id="chatModelPresets">
-        <option value="default"></option>
-        <option value="gemini-2.5-pro"></option>
-        <option value="gemini-2.5-flash"></option>
-        <option value="gemini-3-pro"></option>
-      </datalist>
+    </div>
+    <div class="chat-row" id="chatCustomModelRow" hidden>
+      <label class="chat-field">ID Model
+        <input id="chatModelCustom" type="text" placeholder="contoh: gemini-3.8-flash-high" autocomplete="off">
+      </label>
     </div>
   </div>
   <div class="chat-auth" id="chatAuthBox" hidden>
