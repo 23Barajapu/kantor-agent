@@ -8,6 +8,7 @@ import { loadConfig } from '../lib/config.mjs';
 import { buildState } from '../lib/office.mjs';
 import { scanConversations } from '../lib/antigravity.mjs';
 import { readSafeArtifact } from '../lib/artifacts.mjs';
+import { AcpBridge } from '../lib/acp.mjs';
 import { isDir, isFile, isInsideDir, isPlainObj, isoMs } from '../lib/util.mjs';
 import {
   SECURITY_HEADERS,
@@ -363,6 +364,16 @@ async function handleChat(req, res, pathname, method, { cfg, authManager, acpBri
   }
 }
 
+function isCliMainRow(row) {
+  if (!row || row.nesting_depth !== 0 || row.parent_conversation_id) return false;
+  if (row.source === 'CORTEX_TRAJECTORY_SOURCE_CLI') return true;
+  const dbRootClean = String(row.dbRoot || '')
+    .replace(/[\\/]+$/, '')
+    .replaceAll('\\', '/')
+    .toLowerCase();
+  return path.posix.basename(dbRootClean) === 'antigravity-cli' && row.app_data_dir !== 'antigravity';
+}
+
 /**
  * Membuat instance `http.Server` Kantor Agent lengkap dengan header keamanan,
  * validasi Host, pure-loopback auto-auth, endpoint monitoring, artifact, dan chat ACP.
@@ -375,7 +386,33 @@ export function createKantorServer(opts = {}) {
     bind: opts.bind,
     sandbox: opts.sandbox,
   });
-  const acpBridge = opts.acpBridge ?? null;
+
+  let acpBridge = null;
+  let ownedBridge = false;
+  if (opts.acpBridge !== undefined) {
+    acpBridge = opts.acpBridge;
+  } else if (cfg?.chat?.enabled !== false) {
+    const isSessionRunningOutsideAcp = (id) => {
+      const scan = scanConversations(projectDir, cfg);
+      const row = scan.mains.find((r) => r.conversation_id === id);
+      if (!row) return false;
+      return row.status === 'CASCADE_RUN_STATUS_RUNNING' || row.status === 'RUNNING' || row.not_fully_idle === 1;
+    };
+    const isCliSession = (id) => {
+      const scan = scanConversations(projectDir, cfg);
+      return scan.mains.some((r) => r.conversation_id === id && isCliMainRow(r));
+    };
+    acpBridge = new AcpBridge({
+      projectDir,
+      ...(opts.agyBin !== undefined ? { agyBin: opts.agyBin } : {}),
+      ...(opts.permissionTimeoutMs !== undefined ? { permissionTimeoutMs: opts.permissionTimeoutMs } : {}),
+      cfg,
+      isSessionRunningOutsideAcp,
+      isCliSession,
+    });
+    ownedBridge = true;
+  }
+
   const authManager = createAuthManager(storageDir);
 
   const server = http.createServer(async (req, res) => {
@@ -470,6 +507,23 @@ export function createKantorServer(opts = {}) {
 
   server.authManager = authManager;
   server.kantorConfig = cfg;
+  server.acpBridge = acpBridge;
+
+  if (ownedBridge && acpBridge && typeof acpBridge.shutdown === 'function') {
+    const origClose = server.close.bind(server);
+    server.close = (cb) => {
+      const shutdownPromise = acpBridge.shutdown().catch(() => {});
+      return origClose((err) => {
+        shutdownPromise.finally(() => {
+          if (typeof cb === 'function') cb(err);
+        });
+      });
+    };
+    server.on('close', () => {
+      acpBridge.shutdown().catch(() => {});
+    });
+  }
+
   return server;
 }
 
@@ -548,7 +602,11 @@ if (isMainModule()) {
   });
 
   const shutdown = () => {
-    server.close(() => process.exit(0));
+    Promise.resolve(server.acpBridge?.shutdown?.())
+      .catch(() => {})
+      .finally(() => {
+        server.close(() => process.exit(0));
+      });
     setTimeout(() => process.exit(0), 2000).unref();
   };
   process.once('SIGINT', shutdown);
